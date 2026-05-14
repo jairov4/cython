@@ -3006,6 +3006,9 @@ class CFuncDefNode(FuncDefNode):
             cname = self.entry.func_cname
         entity = type.function_header_code(cname, ', '.join(arg_decls))
         storage_class = ""
+        if self.entry.visibility == 'private' and '::' not in cname and not self.entry.final_func_cname:
+            storage_class = "static "
+
         dll_linkage = None
         modifiers = code.build_function_modifiers(self.entry.func_modifiers)
 

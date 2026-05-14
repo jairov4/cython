@@ -3256,7 +3256,7 @@ class AdjustDefByDirectives(CythonTransform, SkipDeclarations):
         # hack to prevent conditional import fallback functions from
         # being cdpef-ed (global Python variables currently conflict
         # with imports)
-        if self.env.scope.is_module_scope:
+        if hasattr(self.env, "scope") and self.env.scope and self.env.scope.is_module_scope:
             for name, _ in node.items:
                 self.imported_names.add(name)
         return node
