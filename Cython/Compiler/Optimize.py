@@ -1790,8 +1790,8 @@ class EarlyReplaceBuiltinCalls(Visitor.EnvTransform):
 
     def visit_SimpleCallNode(self, node):
         self.visitchildren(node)
-        if self._is_c_base_method_call(node):
-            node = self._handle_simple_base_method_call(node)
+        # if self._is_c_base_method_call(node):
+        #    node = self._handle_simple_base_method_call(node)
 
         function = node.function
         if not self._function_is_builtin_name(function):
@@ -1821,12 +1821,14 @@ class EarlyReplaceBuiltinCalls(Visitor.EnvTransform):
             return node
 
         method_scope = self.current_env()
+        if not method_scope.lookup(base_type.name):
+            # ensure the base type is available in the method scope
+            return node
+
         first_arg = ExprNodes.NameNode(
             node.pos, name=method_scope.arg_entries[0].name,
             entry=method_scope.arg_entries[0])
         new_args = [first_arg] + node.args
-        # FIXME: it should be improved by finding the correct entry
-        #  instead of assuming the type is accessible by its name
         super_class_ref = ExprNodes.NameNode(node.pos, name=base_type.name)
         node = ExprNodes.SimpleCallNode.from_node(
             node,

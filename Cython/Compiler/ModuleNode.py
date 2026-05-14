@@ -1422,8 +1422,7 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                 declaration = method_entry.type.declaration_code(
                     method_entry.final_func_cname)
                 modifiers = code.build_function_modifiers(method_entry.func_modifiers)
-                static = "static " if method_entry.visibility != 'public' else ""
-                code.putln("%s%s%s;" % (static, modifiers, declaration))
+                code.putln("%s%s;" % (modifiers, declaration))
 
     def generate_objstruct_predeclaration(self, type, code):
         if not type.scope:

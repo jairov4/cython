@@ -2712,7 +2712,6 @@ class CFuncDefNode(FuncDefNode):
     #  decorators    [DecoratorNode]        list of decorators
     #
     #  with_gil      boolean    Acquire GIL around body
-    #  promoted      boolean    If it was a def promoted to cpdef
     #  type          CFuncType
     #  py_func       wrapper for calling from Python
     #  overridable   whether or not this is a cpdef function
@@ -2733,7 +2732,6 @@ class CFuncDefNode(FuncDefNode):
     template_declaration = None
     is_const_method = False
     py_func_stat = None
-    promoted = False
     _code_object = None
 
     def unqualified_name(self):
@@ -2793,7 +2791,7 @@ class CFuncDefNode(FuncDefNode):
         self.args = declarator.args
 
         opt_arg_count = self.cfunc_declarator.optional_arg_count
-        if (self.visibility == 'public' or self.api) and opt_arg_count and not self.promoted:
+        if (self.visibility == 'public' or self.api) and opt_arg_count:
             error(self.cfunc_declarator.pos,
                   "Function with optional arguments may not be declared public or api")
 
@@ -3007,10 +3005,7 @@ class CFuncDefNode(FuncDefNode):
         if cname is None:
             cname = self.entry.func_cname
         entity = type.function_header_code(cname, ', '.join(arg_decls))
-        if self.entry.visibility == 'private' and '::' not in cname:
-            storage_class = "static "
-        else:
-            storage_class = ""
+        storage_class = ""
         dll_linkage = None
         modifiers = code.build_function_modifiers(self.entry.func_modifiers)
 
@@ -3242,7 +3237,7 @@ class DefNode(FuncDefNode):
         self.num_required_args = r
 
     def as_cfunction(self, cfunc=None, scope=None, overridable=True, returns=None, except_val=None, has_explicit_exc_clause=False,
-                     modifiers=None, nogil=False, with_gil=False, visibility='private', promoted=False):
+                     modifiers=None, nogil=False, with_gil=False, visibility='private'):
         if self.star_arg:
             error(self.star_arg.pos, "cdef function cannot have star argument")
         if self.starstar_arg:
@@ -3286,7 +3281,7 @@ class DefNode(FuncDefNode):
         else:
             def_node_kwds = {}
             base_type = CAnalysedBaseTypeNode(self.pos, type=py_object_type)
-        def_node_kwds.update({"promoted": promoted})
+
         declarator = CFuncDeclaratorNode(self.pos,
                                          base=CNameDeclaratorNode(self.pos, name=self.name, cname=None),
                                          args=self.args,
@@ -3321,6 +3316,8 @@ class DefNode(FuncDefNode):
         if self.star_arg or self.starstar_arg:
             return False
         if self.name.startswith('__') and self.name.endswith('__'):
+            return False
+        if self.num_required_args != len(self.args):
             return False
 
         is_property = False
@@ -3586,7 +3583,11 @@ class DefNode(FuncDefNode):
             if entry.is_final_cmethod and not env.parent_type.is_final_type:
                 error(self.pos, "Only final types can have final Python (def/cpdef) methods")
             if entry.type.is_cfunction and not entry.is_builtin_cmethod and not self.is_wrapper:
-                warning(self.pos, "Overriding a c(p)def method with a def method. "
+                if env.directives.get("auto_cpdef"):
+                    error(self.pos, "Found c(p)def method overridden with a def method. "
+                        "Ensure the method do not use closures or disable auto_cpdef mode")
+                else:
+                    warning(self.pos, "Overriding a c(p)def method with a def method. "
                         "This can lead to different methods being called depending on the "
                         "call context. Consider using a cpdef method for both.", 5)
 
