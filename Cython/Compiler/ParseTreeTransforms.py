@@ -1,4 +1,6 @@
 import cython
+from .. import auto_cpdef
+
 cython.declare(PyrexTypes=object, Naming=object, ExprNodes=object, Nodes=object,
                Options=object, UtilNodes=object, LetNode=object,
                LetRefNode=object, TreeFragment=object, EncodedString=object,
@@ -3119,13 +3121,12 @@ class AdjustDefByDirectives(CythonTransform, SkipDeclarations):
     # list of directives that cause conversion to cclass
     converts_to_cclass = ('cclass', 'total_ordering', 'dataclasses.dataclass')
 
-    # makes functions cpdef by default
-    auto_ccall = False
 
     def visit_ModuleNode(self, node):
         self.directives = node.directives
         self.in_py_class = False
-        self.in_method = False
+        self.imported_names = set()  # hack, see visit_FromImportStatNode()
+        self.env = node
         self.visitchildren(node)
         return node
 
@@ -3143,6 +3144,10 @@ class AdjustDefByDirectives(CythonTransform, SkipDeclarations):
         nogil = self.directives.get('nogil')
         with_gil = self.directives.get('with_gil')
         except_val = self.directives.get('exceptval')
+        auto_cpdef = self.directives.get('auto_cpdef')
+        no_ccall = self.directives.get('no_ccall')
+        is_ccall = 'ccall' in self.directives
+        is_cfunc = 'cfunc' in self.directives
         has_explicit_exc_clause = False if except_val is None else True
         return_type_node = self.directives.get('returns')
         if return_type_node is None and self.directives['annotation_typing']:
@@ -3157,15 +3162,11 @@ class AdjustDefByDirectives(CythonTransform, SkipDeclarations):
             error(node.pos, "c_compile_guard only allowed on C functions")
         if 'public' in self.directives and 'ccall' not in self.directives:
             error(node.pos, "public directive can only be used with ccall")
-        is_ccall = 'ccall' in self.directives
-        if is_ccall and 'no_ccall' in self.directives:
-            error(node.pos, "ccall and no_ccall directives cannot be combined")
-        is_cfunc = 'cfunc' in self.directives
-        if not is_ccall and not is_cfunc and 'no_ccall' not in self.directives and not self.in_py_class:
-            # do not promote nested functions to avoid closures
-            is_ccall_promoted = self.auto_ccall and not self.in_method and node.is_cdef_func_compatible()
-        else:
-            is_ccall_promoted = False
+        is_ccall_promoted = False
+        if not is_ccall and auto_cpdef and not no_ccall and not is_cfunc and not self.in_py_class:
+            # avoid conflicts with redeclared symbols
+            if hasattr(self.env, "scope") and self.env.scope.is_module_scope and node.name not in self.imported_names:
+                is_ccall_promoted = node.is_cdef_func_compatible()
         if is_ccall or is_ccall_promoted:
             if is_ccall and is_cfunc:
                 error(node.pos, "cfunc and ccall directives cannot be combined")
@@ -3176,12 +3177,11 @@ class AdjustDefByDirectives(CythonTransform, SkipDeclarations):
                 overridable=True, modifiers=modifiers, nogil=nogil,
                 returns=return_type_node, except_val=except_val, has_explicit_exc_clause=has_explicit_exc_clause,
                 visibility=visibility)
-            old_in_method = self.in_method
-            self.in_method = True
+            self.directives['auto_cpdef'] = False  # avoid auto_cpdef nested methods
             node = self.visit(node)
-            self.in_method = old_in_method
+            self.directives['auto_cpdef'] = auto_cpdef
             return node
-        if 'cfunc' in self.directives:
+        if is_cfunc:
             if self.in_py_class:
                 error(node.pos, "cfunc directive is not allowed here")
             else:
@@ -3190,10 +3190,9 @@ class AdjustDefByDirectives(CythonTransform, SkipDeclarations):
                     overridable=False, modifiers=modifiers, nogil=nogil, with_gil=with_gil,
                     returns=return_type_node, except_val=except_val, has_explicit_exc_clause=has_explicit_exc_clause,
                     visibility=visibility)
-                old_in_method = self.in_method
-                self.in_method = True
+                self.directives['auto_cpdef'] = False
                 node = self.visit(node)
-                self.in_method = old_in_method
+                self.directives['auto_cpdef'] = auto_cpdef
                 return node
         if 'inline' in modifiers:
             error(node.pos, "Python functions cannot be declared 'inline'")
@@ -3202,10 +3201,9 @@ class AdjustDefByDirectives(CythonTransform, SkipDeclarations):
             error(node.pos, "Python functions cannot be declared 'nogil'")
         if with_gil:
             error(node.pos, "Python functions cannot be declared 'with_gil'")
-        old_in_method = self.in_method
-        self.in_method = True
+        self.directives["auto_cpdef"] = False
         self.visit_FuncDefNode(node)
-        self.in_method = old_in_method
+        self.directives["auto_cpdef"] = auto_cpdef
         return node
 
     def visit_FuncDefNode(self, node):
@@ -3232,29 +3230,35 @@ class AdjustDefByDirectives(CythonTransform, SkipDeclarations):
         return node
 
     def visit_PyClassDefNode(self, node):
+        self.env, env = node, self.env
         if any(directive in self.directives for directive in self.converts_to_cclass):
             visibility = 'public' if 'public' in self.directives else 'private'
             node = node.as_cclass(visibility=visibility)
-            return self.visit(node)
+            result = self.visit(node)
         else:
-            old_in_pyclass = self.in_py_class
-            self.in_py_class = True
-            old_in_method = self.in_method
-            self.in_method = False
+            self.in_py_class, old_in_pyclass = True, self.in_py_class
             self.visitchildren(node)
             self.in_py_class = old_in_pyclass
-            self.in_method = old_in_method
-            return node
+            result = node
+
+        self.env = env
+        return result
 
     def visit_CClassDefNode(self, node):
-        self.auto_ccall = self.directives.get('auto_cpdef', self.auto_ccall)
-        old_in_pyclass = self.in_py_class
-        self.in_py_class = False
-        old_in_method = self.in_method
-        self.in_method = False
+        self.env, env = node, self.env
+        self.in_py_class, old_in_pyclass = False, self.in_py_class
         self.visitchildren(node)
         self.in_py_class = old_in_pyclass
-        self.in_method = old_in_method
+        self.env = env
+        return node
+
+    def visit_FromImportStatNode(self, node):
+        # hack to prevent conditional import fallback functions from
+        # being cdpef-ed (global Python variables currently conflict
+        # with imports)
+        if self.env.scope.is_module_scope:
+            for name, _ in node.items:
+                self.imported_names.add(name)
         return node
 
 
