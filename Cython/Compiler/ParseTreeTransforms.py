@@ -3117,6 +3117,11 @@ class AdjustDefByDirectives(CythonTransform, SkipDeclarations):
     @cython.inline
     @cython.nogil
     @cython.critical_section
+
+    Apply the auto_cpdef directive.
+
+    It requires the MarkClosureVisitor already passed because it is not possible
+    to promote functions that need closures.
     """
     # list of directives that cause conversion to cclass
     converts_to_cclass = ('cclass', 'total_ordering', 'dataclasses.dataclass')
