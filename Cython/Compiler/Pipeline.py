@@ -161,7 +161,7 @@ def create_pipeline(context, mode, exclude_classes=()):
     from .ParseTreeTransforms import ExpandInplaceOperators, ParallelRangeTransform
     from .ParseTreeTransforms import CalculateQualifiedNamesTransform
     from .TypeInference import MarkParallelAssignments, MarkOverflowingArithmetic
-    from .ParseTreeTransforms import AdjustDefByDirectives, AlignFunctionDefinitions, AutoCpdefFunctionDefinitions
+    from .ParseTreeTransforms import AdjustDefByDirectives, AlignFunctionDefinitions
     from .ParseTreeTransforms import RemoveUnreachableCode, GilCheck, CoerceCppTemps
     from .FlowControl import ControlFlowAnalysis
     from .AnalysedTreeTransforms import AutoTestDictTransform
@@ -199,10 +199,9 @@ def create_pipeline(context, mode, exclude_classes=()):
         InterpretCompilerDirectives(context, context.compiler_directives),
         ParallelRangeTransform(context),
         WithTransform(),
-        AdjustDefByDirectives(context),
-        _align_function_definitions,
         MarkClosureVisitor(context),
-        AutoCpdefFunctionDefinitions(context),
+        _align_function_definitions,
+        AdjustDefByDirectives(context),
         RemoveUnreachableCode(context),
         ConstantFolding(),
         FlattenInListTransform(),
@@ -291,14 +290,13 @@ def create_py_pipeline(context, options, result):
 
 def create_pyx_as_pxd_pipeline(context, result):
     from .ParseTreeTransforms import AlignFunctionDefinitions, \
-        MarkClosureVisitor, WithTransform, AnalyseDeclarationsTransform
+        WithTransform, AnalyseDeclarationsTransform
     from .Optimize import ConstantFolding, FlattenInListTransform
     from .Nodes import StatListNode
     pipeline = []
     pyx_pipeline = create_pyx_pipeline(context, context.options, result,
                                        exclude_classes=[
                                            AlignFunctionDefinitions,
-                                           MarkClosureVisitor,
                                            ConstantFolding,
                                            FlattenInListTransform,
                                            WithTransform

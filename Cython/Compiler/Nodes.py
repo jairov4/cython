@@ -3005,10 +3005,10 @@ class CFuncDefNode(FuncDefNode):
         if cname is None:
             cname = self.entry.func_cname
         entity = type.function_header_code(cname, ', '.join(arg_decls))
-        if self.entry.visibility == 'private' and '::' not in cname:
+        storage_class = ""
+        if self.entry.visibility == 'private' and '::' not in cname and not self.entry.final_func_cname:
             storage_class = "static "
-        else:
-            storage_class = ""
+
         dll_linkage = None
         modifiers = code.build_function_modifiers(self.entry.func_modifiers)
 
@@ -3240,7 +3240,7 @@ class DefNode(FuncDefNode):
         self.num_required_args = r
 
     def as_cfunction(self, cfunc=None, scope=None, overridable=True, returns=None, except_val=None, has_explicit_exc_clause=False,
-                     modifiers=None, nogil=False, with_gil=False):
+                     modifiers=None, nogil=False, with_gil=False, visibility='private'):
         if self.star_arg:
             error(self.star_arg.pos, "cdef function cannot have star argument")
         if self.starstar_arg:
@@ -3284,6 +3284,7 @@ class DefNode(FuncDefNode):
         else:
             def_node_kwds = {}
             base_type = CAnalysedBaseTypeNode(self.pos, type=py_object_type)
+
         declarator = CFuncDeclaratorNode(self.pos,
                                          base=CNameDeclaratorNode(self.pos, name=self.name, cname=None),
                                          args=self.args,
@@ -3302,7 +3303,7 @@ class DefNode(FuncDefNode):
                             overridable=overridable,
                             with_gil=with_gil,
                             nogil=nogil,
-                            visibility='private',
+                            visibility=visibility,
                             api=False,
                             directive_locals=getattr(cfunc, 'directive_locals', {}),
                             directive_returns=returns,
@@ -3317,6 +3318,27 @@ class DefNode(FuncDefNode):
             return False
         if self.star_arg or self.starstar_arg:
             return False
+        if self.name.startswith('__') and self.name.endswith('__'):
+            return False
+        if self.num_required_args != len(self.args):
+            return False
+
+        is_property = False
+        from . import ExprNodes
+        if self.decorators:
+            for decorator in self.decorators:
+                func = decorator.decorator
+                if func.is_name:
+                    self.is_classmethod |= func.name == 'classmethod'
+                    self.is_staticmethod |= func.name == 'staticmethod'
+                    is_property |= func.name == 'property'
+                elif isinstance(func, ExprNodes.AttributeNode):
+                    if func.attribute in ('setter', 'deleter'):
+                        is_property = True
+
+        if self.is_classmethod or self.is_staticmethod or is_property:
+            return False
+
         return True
 
     def analyse_declarations(self, env):
@@ -3564,7 +3586,11 @@ class DefNode(FuncDefNode):
             if entry.is_final_cmethod and not env.parent_type.is_final_type:
                 error(self.pos, "Only final types can have final Python (def/cpdef) methods")
             if entry.type.is_cfunction and not entry.is_builtin_cmethod and not self.is_wrapper:
-                warning(self.pos, "Overriding a c(p)def method with a def method. "
+                if env.directives.get("auto_cpdef"):
+                    error(self.pos, "Found c(p)def method overridden with a def method. "
+                        "Ensure the method do not use closures or disable auto_cpdef mode")
+                else:
+                    warning(self.pos, "Overriding a c(p)def method with a def method. "
                         "This can lead to different methods being called depending on the "
                         "call context. Consider using a cpdef method for both.", 5)
 
@@ -5262,7 +5288,7 @@ class PyClassDefNode(ClassDefNode):
         self.target = ExprNodes.NameNode(pos, name=name)
         self.class_cell = ExprNodes.ClassCellInjectorNode(self.pos)
 
-    def as_cclass(self):
+    def as_cclass(self, visibility):
         """
         Return this node as if it were declared as an extension class
         """
@@ -5272,7 +5298,7 @@ class PyClassDefNode(ClassDefNode):
 
         from . import ExprNodes
         return CClassDefNode(self.pos,
-                             visibility='private',
+                             visibility=visibility,
                              module_name=None,
                              class_name=self.name,
                              bases=self.bases or ExprNodes.TupleNode(self.pos, args=[]),
