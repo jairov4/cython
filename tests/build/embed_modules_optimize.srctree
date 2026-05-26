@@ -1,0 +1,300 @@
+# mode: run
+# tag: embed
+
+# standalone
+PYTHON cythonize_embed.py a.pyx b.pyx
+CYTHON --embed --embed-modules a,b main_module.pyx
+PYTHON build.py main_module main_module.c a.c b.c
+PYTHON run.py main_module
+
+# With auto_cpdef=True (uses function pointer import)
+PYTHON cythonize_embed.py -f -X auto_cpdef=True a.pyx b.pyx
+PYTHON check_codegen.py auto_cpdef a.c
+CYTHON --embed --embed-modules a,b main_module.pyx
+PYTHON build.py main_module main_module.c a.c b.c
+PYTHON run.py main_module
+
+# CPP auto_cpdef=True (uses function pointer import)
+PYTHON cythonize_embed.py -+ -f -X auto_cpdef=True a.pyx b.pyx
+PYTHON check_codegen.py auto_cpdef a.cpp
+CYTHON -+ --embed --embed-modules a,b main_module.pyx
+PYTHON build.py main_module main_module.cpp a.cpp b.cpp
+PYTHON run.py main_module
+
+# With lto=True (uses direct function call)
+PYTHON cythonize_embed.py -f -X auto_cpdef=True -X lto=True a.pyx b.pyx
+PYTHON check_codegen.py lto a.c
+CYTHON --embed --embed-modules a,b main_module.pyx
+PYTHON build.py main_module main_module.c a.c b.c
+PYTHON run.py main_module
+
+# CPP With lto=True (uses direct function call)
+PYTHON cythonize_embed.py -+ -f -X auto_cpdef=True -X lto=True a.pyx b.pyx
+PYTHON check_codegen.py lto a.cpp
+CYTHON -+ --embed --embed-modules a,b main_module.pyx
+PYTHON build.py main_module main_module.cpp a.cpp b.cpp
+PYTHON run.py main_module
+
+################### cythonize_embed.py ########################
+
+import sys
+import Cython.Compiler.Options
+Cython.Compiler.Options.cimport_from_pyx = True
+
+from Cython.Build.Cythonize import main
+sys.argv[0] = 'cythonize.py'
+main()
+
+################### check_codegen.py ########################
+
+import sys
+import os
+
+mode = sys.argv[1]
+a_c_path = sys.argv[2]
+with open(a_c_path, 'r') as f:
+    a_c_content = f.read()
+
+if mode == 'auto_cpdef':
+    assert "static int (*__pyx_f_1b_1B_4prop___get__)(struct __pyx_obj_1b_B *);" in a_c_content
+    assert "__pyx_f_1b_1B_4prop___get__(((struct __pyx_obj_1b_B *)__pyx_v_self))" in a_c_content
+    print("OK: auto_cpdef mode uses function pointer import")
+
+elif mode == 'lto':
+    assert "int __pyx_f_1b_1B_4prop___get__(struct __pyx_obj_1b_B *);" in a_c_content
+    assert "__pyx_f_1b_1B_4prop___get__(((struct __pyx_obj_1b_B *)__pyx_v_self))" in a_c_content
+    print("OK: LTO mode uses direct function call")
+
+else:
+    print(f"Unknown mode: {mode}")
+    sys.exit(1)
+
+################### build.py ########################
+
+import os
+import setuptools
+import sys
+import sysconfig
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+
+IS_WINDOWS = sys.platform == 'win32'
+
+if IS_WINDOWS:
+    import distutils.msvc9compiler as setuptools_msvc  # from setuptools
+    ccompiler = setuptools_msvc.MSVCCompiler()
+    ccompiler.initialize()
+    compiler_exe = ccompiler.cc
+    linker_exe = ccompiler.linker_exe
+else:
+    import distutils.unixccompiler as setuptools_cc  # from setuptools
+    ccompiler = setuptools_cc.UnixCCompiler()
+    compiler_exe = ccompiler.compiler
+    linker_exe = ccompiler.linker_exe
+
+
+def get_config_var(name, default='', *, _get_config_var=sysconfig.get_config_vars().get):
+    return _get_config_var(name, default)
+
+
+INCDIR = sysconfig.get_path('include')
+LIBDIR1 = get_config_var('LIBDIR')
+LIBDIR2 = get_config_var('LIBPL')
+PYLIB_DIR = get_config_var("installed_platbase")
+PYLIB = get_config_var('LIBRARY')
+PYLIB_DYN = get_config_var('LDLIBRARY')
+
+if sys.platform == 'darwin':
+    PYLIB_DYN = f'python{sys.version_info[0]}.{sys.version_info[1]}'
+elif PYLIB_DYN == PYLIB:
+    # no shared library
+    PYLIB_DYN = ''
+elif PYLIB_DYN:
+    # 'lib(XYZ).so' -> XYZ
+    PYLIB_DYN = os.path.splitext(PYLIB_DYN)[0]
+    if PYLIB_DYN.startswith('lib'):
+        PYLIB_DYN = PYLIB_DYN[3:]
+
+CFLAGS = get_config_var('CFLAGS') + ' ' + os.environ.get('CFLAGS', '')
+
+OBJ_EXT = ccompiler.obj_extension
+LIBS = get_config_var('LIBS')
+SYSLIBS = get_config_var('SYSLIBS')
+EXE_EXT = get_config_var('EXE')
+
+
+def compile(source_file):
+    ccompiler.compile(
+        sources=[source_file],
+        include_dirs=[INCDIR],
+        extra_postargs=CFLAGS.split(),
+    )
+
+
+def link_exe(objects, app_name):
+    library_dirs = [
+        libdir for libdir in
+        [LIBDIR1, LIBDIR2, os.path.join(PYLIB_DIR, "libs")]
+        if libdir and os.path.isdir(libdir)
+    ]
+    if PYLIB_DYN:
+        libraries = [PYLIB_DYN]
+    elif PYLIB:
+        objects = [*objects, os.path.join(LIBDIR1, PYLIB)]
+        libraries = [
+            lib[2:] if lib.startswith('-l') else lib
+            for lib in [*LIBS.split(), *SYSLIBS.split()]
+        ]
+    else:
+        libraries = []
+
+    ccompiler.link(
+        ccompiler.EXECUTABLE,
+        objects,
+        output_filename=app_name + EXE_EXT,
+        libraries=libraries,
+        library_dirs=library_dirs,
+        runtime_library_dirs=[PYLIB_DIR],
+    )
+
+
+def main(args):
+    app_name, *c_files = args
+    c_base_names = [Path(filename).stem for filename in c_files]
+
+    print("CFLAGS:", CFLAGS)
+    print(f"PYLIBS: {PYLIB!r} {PYLIB_DYN!r}")
+    print(f"LINK: {LIBDIR1!r} {LIBDIR2!r}")
+    print("LIBDIR1:", os.listdir(LIBDIR1))
+
+    compile_commands = c_files
+    for command in compile_commands:
+        print("CC:", command)
+
+    with ThreadPoolExecutor() as pool:
+        for _ in pool.map(compile, compile_commands):
+            pass
+
+    link_exe(
+        [filename + OBJ_EXT for filename in c_base_names],
+        app_name=app_name,
+    )
+
+
+if __name__ == '__main__':
+    main(sys.argv[1:])
+
+
+################### run.py ########################
+
+import os
+import sys
+from subprocess import run
+from sysconfig import get_config_var
+
+EXE_EXT = get_config_var('EXE')
+PYLIB_DIR = get_config_var("installed_platbase")
+
+PATH = os.environ.get('PATH', '')
+sep = os.pathsep
+os.environ.update(PATH=f".{sep}{PYLIB_DIR}{sep}{PATH}")
+
+result = run([os.path.abspath(sys.argv[1] + EXE_EXT)], capture_output=True)
+assert b"DONE" in result.stdout, result.stdout
+assert b"3" in result.stdout, result.stdout  # a.A().prop should return 3 (2 + 1)
+assert b"2" in result.stdout, result.stdout  # b.B().prop should return 2
+assert b"Hello from func_in_b()" in result.stdout, result.stdout
+
+
+################# main_module.pyx ####################
+
+import a
+import b
+
+assert __name__ == '__main__'
+
+# Test class methods
+a.A().s()
+b.B().mtd()
+
+# Test properties
+prop_a = a.A().prop
+prop_b = b.B().prop
+a.A().color = a.Color.RED
+assert a.A().color == a.Color.RED
+assert a.A().prop_obj.prop == 2
+
+print(f"a.A().prop = {prop_a}")
+print(f"b.B().prop = {prop_b}")
+
+assert prop_a == 3, f"Expected 3, got {prop_a}"
+assert prop_b == 2, f"Expected 2, got {prop_b}"
+
+# Test ccall functions
+a.func_in_a()
+b.func_in_b()
+
+print("DONE")
+
+
+################# a.pyx ####################
+
+from enum import Enum
+from b import B, func_in_b
+from b cimport B, func_in_b
+from cython import ccall, cclass, int
+
+@cclass
+class Color(Enum):
+    RED = 1
+
+@ccall
+def func_in_a():
+    A().color = Color.RED
+    assert A().color == Color.RED
+    assert A().prop_obj.prop == 2
+    func_in_b()
+
+@cclass
+class A(B):
+    @ccall
+    def s(self):
+        super().mtd()
+
+    @property
+    def prop(self) -> int:
+        return super().prop + 1
+
+    @property
+    def color(self) -> Color:
+        return Color.RED
+
+    @color.setter
+    def color(self, Color val) -> None:
+        pass  # no-op for testing
+
+    @property
+    def prop_obj(self) -> B:
+        return B()
+
+################# b.pyx ####################
+
+from cython import cclass, ccall, int
+
+@ccall
+def func_in_b():
+    print("Hello from func_in_b()")
+
+@cclass
+class B:
+    @ccall
+    def mtd(self):
+        pass
+
+    @property
+    def prop(self) -> int:
+        return 2
+
+    @prop.setter
+    def prop(self, int val) -> None:
+        pass  # no-op for testing

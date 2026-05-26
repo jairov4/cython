@@ -304,6 +304,10 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             if (entry.create_wrapper and entry.scope is env
                     and entry.is_type and (entry.type.is_enum or entry.type.is_cpp_enum)):
                 entry.type.create_type_wrapper(env)
+                # Also create the C-to-Python conversion utility code for enums
+                # This must happen before the utility code injection stage
+                if hasattr(entry.type, 'create_to_py_utility_code'):
+                    entry.type.create_to_py_utility_code(env)
 
     def process_implementation(self, options, result):
         env = self.scope
@@ -1411,6 +1415,13 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                 if not method_entry.is_inherited:
                     code.putln("%s;" % method_entry.type.declaration_code("(*%s)" % method_entry.cname))
                     code.globalstate.use_entry_utility_code(method_entry)
+            if hasattr(scope, 'property_entries'):
+                for prop_entry in scope.property_entries:
+                    if prop_entry.is_cproperty and prop_entry.scope:
+                        getter = prop_entry.scope.lookup_here("__get__")
+                        if getter:
+                            code.putln("%s;" % getter.type.declaration_code("(*%s)" % getter.cname))
+                            code.globalstate.use_entry_utility_code(getter)
             code.putln("};")
 
     def generate_exttype_vtabptr_declaration(self, entry, code):
@@ -1567,7 +1578,8 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             if (entry.used
                     or entry.visibility == 'public'
                     or entry.api
-                    or from_pyx):
+                    or from_pyx
+                    or entry.utility_code_definition):
                 generate_cfunction_declaration(entry, env, code, definition)
 
     def generate_variable_definitions(self, env, code):
@@ -2668,6 +2680,18 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         # None in that case.
         user_get_entry = scope.lookup_here("__get__")
 
+        # For auto_cpdef properties, each property has its own getter function
+        # in the PyGetSetDef table. The tp_descr_get slot is not needed and
+        # would be incorrect because it can't handle multiple properties with
+        # different return types. Skip generating it if all properties are overridable.
+        all_overridable = all(
+            getattr(prop_entry.scope, 'is_overridable', False)
+            for prop_entry in scope.property_entries
+            if getattr(prop_entry, 'scope', None)
+        )
+        if all_overridable and scope.property_entries:
+            return
+
         code.start_slotfunc(scope, PyrexTypes.py_objptr_type, "tp_descr_get", "PyObject *o, PyObject *i, PyObject *c", needs_funcstate=False)
         code.putln(
             "PyObject *r = 0;")
@@ -2677,9 +2701,44 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             "if (!c) c = Py_None;")
         #code.put_incref("i", py_object_type)
         #code.put_incref("c", py_object_type)
-        code.putln(
-            "r = %s(o, i, c);" % (
-                user_get_entry.func_cname))
+        # For property accessor wrappers (auto_cpdef), the entry has the property
+        # accessor signature (1 arg) instead of descrgetfunc signature (3 args).
+        # Generate the call with the correct number of arguments.
+        sig = getattr(user_get_entry, 'signature', None)
+        if sig and sig.min_num_fixed_args() <= 1:
+            # Property accessor signature - only call with self
+            # Cast o to the extension type for C function calls
+            ext_type = scope.parent_type
+            if ext_type:
+                cast_type = "struct %s" % ext_type.objstruct_cname
+                call_code = "%s((%s *)o)" % (user_get_entry.func_cname, cast_type)
+            else:
+                call_code = "%s(o)" % (user_get_entry.func_cname)
+
+            # For auto_cpdef properties, user_get_entry is the Python wrapper entry
+            # but its func_cname points to the C function. Get the C return type
+            # from the property scope's __get__ entry if available.
+            c_return_type = None
+            for prop_entry in scope.property_entries:
+                prop_scope = getattr(prop_entry, 'scope', None)
+                if prop_scope:
+                    get_entry = prop_scope.lookup_here("__get__")
+                    if get_entry and get_entry.type and get_entry.type.return_type:
+                        c_return_type = get_entry.type.return_type
+                        break
+            if c_return_type and not c_return_type.is_pyobject and not c_return_type.is_void:
+                c_return_type.create_to_py_utility_code(scope)
+                tmpvar = "__pyx_tmp_r"
+                code.putln("    %s;" % c_return_type.declaration_code(tmpvar))
+                code.putln("    %s = %s;" % (tmpvar, call_code))
+                code.putln("    %s;" % c_return_type.to_py_call_code(tmpvar, "r", PyrexTypes.py_object_type))
+            else:
+                code.putln("    r = %s;" % call_code)
+        else:
+            # descrgetfunc signature - call with obj, index, context
+            code.putln(
+                "r = %s(o, i, c);" % (
+                    user_get_entry.func_cname))
         #code.put_decref("i", py_object_type)
         #code.put_decref("c", py_object_type)
         code.putln(
@@ -2700,24 +2759,58 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         code.putln(
             "if (v) {")
         if user_set_entry:
-            code.putln(
-                "return %s(o, i, v);" % (
-                    user_set_entry.func_cname))
+            # For property accessor wrappers (auto_cpdef), the entry has the property
+            # accessor signature (2 args: self, value) instead of descrsetfunc signature (3 args).
+            sig = getattr(user_set_entry, 'signature', None)
+            ext_type = scope.parent_type
+            if sig and sig.min_num_fixed_args() <= 2:
+                # Property accessor signature - call with self, value
+                if ext_type:
+                    cast_type = "struct %s" % ext_type.objstruct_cname
+                    code.putln(
+                        "return %s((%s *)o, v);" % (
+                            user_set_entry.func_cname, cast_type))
+                else:
+                    code.putln(
+                        "return %s(o, v);" % (
+                            user_set_entry.func_cname))
+            else:
+                # descrsetfunc signature - call with obj, index, value
+                code.putln(
+                    "return %s(o, i, v);" % (
+                        user_set_entry.func_cname))
         else:
             self.generate_guarded_basetype_call(
                 base_type, None, "tp_descr_set", "descrsetfunc", "o, i, v", code)
             code.putln(
                 'PyErr_SetString(PyExc_NotImplementedError, "__set__");')
             code.putln(
-                "return -1;")
+             "return -1;")
         code.putln(
             "}")
         code.putln(
             "else {")
         if user_del_entry:
-            code.putln(
-                "return %s(o, i);" % (
-                    user_del_entry.func_cname))
+            # For property accessor wrappers (auto_cpdef), the entry has the property
+            # accessor signature (1 arg: self) instead of descdelfunc signature (2 args).
+            sig = getattr(user_del_entry, 'signature', None)
+            ext_type = scope.parent_type
+            if sig and sig.min_num_fixed_args() <= 1:
+                # Property accessor signature - call with self only
+                if ext_type:
+                    cast_type = "struct %s" % ext_type.objstruct_cname
+                    code.putln(
+                        "return %s((%s *)o);" % (
+                            user_del_entry.func_cname, cast_type))
+                else:
+                    code.putln(
+                        "return %s(o);" % (
+                            user_del_entry.func_cname))
+            else:
+                # descdelfunc signature - call with obj, index
+                code.putln(
+                    "return %s(o, i);" % (
+                        user_del_entry.func_cname))
         else:
             self.generate_guarded_basetype_call(
                 base_type, None, "tp_descr_set", "descrsetfunc", "o, i, v", code)
@@ -2740,43 +2833,105 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                 self.generate_property_set_function(entry, code)
 
     def generate_property_get_function(self, property_entry, code):
+        if not property_entry or not property_entry.scope or not code:
+            return
         property_scope = property_entry.scope
+        if not property_scope.parent_scope:
+            return
         property_entry.getter_cname = property_scope.parent_scope.mangle(
             Naming.prop_get_prefix, property_entry.name)
         get_entry = property_scope.lookup_here("__get__")
+
+        if not get_entry:
+            return
+
+        # Check if this is an overridable property (auto_cpdef enabled)
+        # Cast o to the correct type for C++ compatibility
+        is_overridable = property_scope.is_overridable
+        ext_type = property_scope.parent_type
+        # For auto_cpdef properties, cast to struct type, not PyTypeObject*
+        if is_overridable and ext_type.objstruct_cname:
+            parent_type_cname = "struct %s *" % ext_type.objstruct_cname
+        else:
+            parent_type_cname = ext_type.typeptr_cname
 
         code.putln("")
         code.putln(
             "static PyObject *%s(PyObject *o, CYTHON_UNUSED void *x) {" % (
                 property_entry.getter_cname))
-        code.putln(
-            "return %s(o);" % (
-                get_entry.func_cname))
+
+        if is_overridable:
+            call_code = "%s((%s)o)" % (get_entry.func_cname, parent_type_cname)
+        else:
+            call_code = "%s(o)" % (get_entry.func_cname)
+
+        return_type = getattr(getattr(get_entry, 'type', None), 'return_type', None)
+        if return_type and not return_type.is_pyobject and not return_type.is_void:
+            return_type.create_to_py_utility_code(property_scope.global_scope())
+            tmpvar = "__pyx_tmp_r"
+            code.putln("    %s;" % return_type.declaration_code(tmpvar))
+            code.putln("    %s = %s;" % (tmpvar, call_code))
+            code.putln("    return %s(%s);" % (return_type.to_py_function, tmpvar))
+        elif return_type and return_type.is_extension_type:
+            # For extension types, the C function returns a struct pointer
+            # which needs to be cast to PyObject* for C++ compatibility
+            code.putln("    return (PyObject *)%s;" % call_code)
+        else:
+            code.putln("    return %s;" % call_code)
+
         code.putln(
             "}")
 
     def generate_property_set_function(self, property_entry, code):
         property_scope = property_entry.scope
-        property_entry.setter_cname = property_scope.parent_scope.mangle(
-            Naming.prop_set_prefix, property_entry.name)
         set_entry = property_scope.lookup_here("__set__")
         del_entry = property_scope.lookup_here("__del__")
 
+        if not set_entry:
+            return
+
+        # Check if this is an overridable property (auto_cpdef enabled)
+        # Cast o and v to the correct types for C++ compatibility
+        is_overridable = property_scope.is_overridable
+        ext_type = property_scope.parent_type
+        # For auto_cpdef properties, cast to struct type, not PyTypeObject*
+        if is_overridable and ext_type.objstruct_cname:
+            parent_type_cname = "struct %s *" % ext_type.objstruct_cname
+        else:
+            parent_type_cname = ext_type.typeptr_cname
+
+        property_entry.setter_cname = property_scope.parent_scope.mangle(
+            Naming.prop_set_prefix, property_entry.name)
         code.putln("")
         code.putln(
             "static int %s(PyObject *o, PyObject *v, CYTHON_UNUSED void *x) {" % (
                 property_entry.setter_cname))
-        code.putln(
-            "if (v) {")
-        if set_entry:
-            code.putln(
-                "return %s(o, v);" % (
-                    set_entry.func_cname))
+        code.putln("if (v) {")
+        if is_overridable:
+            # Check if the C function returns void (property setter) or int
+            set_type = set_entry.type
+            if set_type and hasattr(set_type, 'return_type') and set_type.return_type.is_void:
+                # Check if the setter has typed arguments (not PyObject*)
+                # If so, we need to convert the Python object to a C value
+                if len(set_type.args) >= 2:
+                    value_arg = set_type.args[1]
+                    if not value_arg.type.is_pyobject:
+                        # Generate conversion code: extract C value from PyObject*
+                        value_type_cname = value_arg.type.empty_declaration_code()
+                        code.putln("    %s __pyx_v_converted_value;" % value_type_cname)
+                        code.putln("    if ((__pyx_v_converted_value = (%s)PyLong_AsLong(v)) == -1 && PyErr_Occurred()) return -1;" % value_type_cname)
+                        code.putln("    %s((%s)o, __pyx_v_converted_value);" % (set_entry.func_cname, parent_type_cname))
+                    else:
+                        code.putln("    %s((%s)o, v);" % (set_entry.func_cname, parent_type_cname))
+                else:
+                    code.putln("    %s((%s)o, v);" % (set_entry.func_cname, parent_type_cname))
+                code.putln("    return 0;")
+            else:
+                code.putln("    return %s((%s)o, v);" % (set_entry.func_cname, parent_type_cname))
         else:
             code.putln(
-                'PyErr_SetString(PyExc_NotImplementedError, "__set__");')
-            code.putln(
-                "return -1;")
+                "    return %s(o, v);" % (
+                    set_entry.func_cname))
         code.putln(
             "}")
         code.putln(
@@ -2809,7 +2964,7 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             code.putln("#endif")
 
         if ext_type.typedef_flag:
-            objstruct = ext_type.objstruct_cname
+            objstruct = "struct %s" % ext_type.objstruct_cname
         else:
             objstruct = "struct %s" % ext_type.objstruct_cname
 
@@ -2834,7 +2989,17 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             code.putln("};")
 
         code.putln("static PyType_Slot %s_slots[] = {" % ext_type.typeobj_cname)
+        # Check if we should skip tp_descr_get/tp_descr_set for auto_cpdef properties
+        all_props_overridable = scope.property_entries and all(
+            getattr(prop_entry.scope, 'is_overridable', False)
+            for prop_entry in scope.property_entries
+            if getattr(prop_entry, 'scope', None)
+        )
         for slot in TypeSlots.get_slot_table(code.globalstate.directives):
+            # Skip tp_descr_get/tp_descr_set for auto_cpdef properties
+            # since they're handled by PyGetSetDef instead
+            if all_props_overridable and slot.slot_name in ('tp_descr_get', 'tp_descr_set'):
+                continue
             slot.generate_spec(scope, code)
         if generate_members:
             code.putln("{Py_tp_members, (void*)%s_members}," % ext_type.typeobj_cname)
@@ -2877,8 +3042,19 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             "sizeof(%s), /*tp_basicsize*/" % objstruct)
         code.putln(
             "0, /*tp_itemsize*/")
+        # Check if we should skip tp_descr_get/tp_descr_set for auto_cpdef properties
+        all_props_overridable = scope.property_entries and all(
+            getattr(prop_entry.scope, 'is_overridable', False)
+            for prop_entry in scope.property_entries
+            if getattr(prop_entry, 'scope', None)
+        )
         for slot in TypeSlots.get_slot_table(code.globalstate.directives):
-            slot.generate(scope, code)
+            # Skip tp_descr_get/tp_descr_set for auto_cpdef properties
+            # since they're handled by PyGetSetDef instead
+            if all_props_overridable and slot.slot_name in ('tp_descr_get', 'tp_descr_set'):
+                code.putln("0, /*%s*/" % slot.slot_name)
+            else:
+                slot.generate(scope, code)
         code.putln(
             "};")
 
@@ -3921,7 +4097,8 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
     def _select_exported_entries(self, all_entries):
         return [
             entry for entry in all_entries
-            if entry.api or entry.defined_in_pxd or (Options.cimport_from_pyx and entry.visibility != 'extern')
+            if entry.api or entry.defined_in_pxd
+            or (Options.cimport_from_pyx and entry.visibility != 'extern')
         ]
 
     def generate_c_variable_export_code(self, env, code):
@@ -3982,7 +4159,8 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
     def _select_imported_entries(self, all_entries, used_only=False):
         return [
             entry for entry in all_entries
-            if entry.defined_in_pxd and (not used_only or entry.used)
+            if entry.defined_in_pxd
+                and (not used_only or entry.used)
         ]
 
     def generate_c_variable_import_code_for_module(self, module, env, code):
@@ -4008,21 +4186,70 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
 
     def generate_c_function_import_code_for_module(self, module, env, code):
         """Generate import code for all exported C functions in a cimported module.
+
+        Inline property getter/setter entries (auto_cpdef or marked inline) are
+        excluded because they are accessed via the vtable mechanism which handles
+        cross-module calls correctly. Regular properties are still imported.
         """
         entries = self._select_imported_entries(module.cfunc_entries, used_only=True)
         if not entries:
             return
 
+        # Filter out inline property getter/setter entries - they use vtable access
+        # Regular properties are still imported via function import
+        regular_entries = [
+            entry for entry in entries
+            if not self._is_inline_property_entry(entry)
+        ]
+        if not regular_entries:
+            return
+
         imports = [
             # (signature, name, cname)
             (entry.type.signature_string(), entry.name, entry.cname)
-            for entry in entries
+            for entry in regular_entries
         ]
         code.globalstate.use_utility_code(
             UtilityCode.load_cached("FunctionImport", "ImportExport.c"))
 
         _generate_import_code(
             code, self.pos, imports, module.qualified_name, f"__Pyx_ImportFunction_{Naming.cyversion}", "void (**{name})(void)")
+
+    def _is_inline_property_entry(self, entry):
+        """Check if an entry is an inline property getter/setter that should be
+        accessed via vtable instead of function import.
+
+        An entry is considered inline if:
+        - It's a property getter/setter (scope is property scope)
+        - AND it has is_overridable=True (auto_cpdef enabled)
+        - AND it's not being imported (defined_in_pxd means it's from a cimport)
+
+        Auto_cpdef properties are imported via function pointers at module load time
+        to avoid import order dependency and ensure cross-platform compatibility.
+
+        For LTO (Link Together Optimization), all auto_cpdef properties should be
+        called directly since all modules are linked together.
+        """
+        if not entry.scope or not entry.scope.is_property_scope:
+            return False
+        # For LTO, check if the property's module is being compiled together
+        is_lto = self.directives.get('lto', False)
+        if is_lto and entry.is_overridable:
+            compilation_sources = self.scope.global_scope().compilation_sources
+            if compilation_sources:
+                prop_module_scope = entry.scope
+                while prop_module_scope and not prop_module_scope.is_module_scope:
+                    prop_module_scope = prop_module_scope.outer_scope
+                if prop_module_scope and prop_module_scope.qualified_name in compilation_sources:
+                    # Property is from a module being compiled together, call directly
+                    return True
+        # Auto_cpdef properties that are imported (defined_in_pxd) should use
+        # function pointers, not vtable access
+        if entry.is_overridable and entry.defined_in_pxd:
+            return False
+        if entry.is_overridable:
+            return True
+        return False
 
     def generate_type_init_code(self, env, subfunction, code):
         # Generate type import code for extern extension types
@@ -4164,6 +4391,20 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                             meth_entry.cname,
                             cast,
                             meth_entry.func_cname))
+
+            if hasattr(type.scope, 'property_entries'):
+                for prop_entry in type.scope.property_entries:
+                    if prop_entry.is_cproperty and prop_entry.scope:
+                        getter = prop_entry.scope.lookup_here("__get__")
+                        if getter and getter.func_cname:
+                            vtable_type = getter.vtable_type or getter.type
+                            cast = vtable_type.signature_cast_string()
+                            code.putln(
+                                "%s.%s = %s%s;" % (
+                                    type.vtable_cname,
+                                    getter.cname,
+                                    cast,
+                                    getter.func_cname))
 
 
 # cimport/export code for functions and pointers.
@@ -4311,7 +4552,7 @@ class ModuleImportGenerator:
 
 
 def generate_cfunction_declaration(entry, env, code, definition):
-    from_cy_utility = entry.used and entry.utility_code_definition
+    from_cy_utility = entry.utility_code_definition is not None
     if entry.used and entry.inline_func_in_pxd or (not entry.in_cinclude and (
             definition or entry.defined_in_pxd or entry.visibility == 'extern' or from_cy_utility)):
         if entry.visibility == 'extern':
@@ -4328,7 +4569,52 @@ def generate_cfunction_declaration(entry, env, code, definition):
             dll_linkage = None
         type = entry.type
 
-        if entry.defined_in_pxd and not definition:
+        if entry.defined_in_pxd and entry.scope and entry.scope.is_property_scope:
+            # Property getter/setter with cimport_from_pyx:
+            # For LTO, check if the property's module is being compiled together
+            is_lto = code.globalstate.directives.get('lto', False)
+            is_linked_module = False
+            if is_lto:
+                compilation_sources = code.globalstate.module_node.scope.global_scope().compilation_sources
+                if compilation_sources:
+                    prop_module_scope = entry.scope
+                    while prop_module_scope and not prop_module_scope.is_module_scope:
+                        prop_module_scope = prop_module_scope.outer_scope
+                    if prop_module_scope and prop_module_scope.qualified_name in compilation_sources:
+                        is_linked_module = True
+
+            # For auto_cpdef properties (is_overridable=True), use function pointers
+            # that are imported at module load time. This avoids import order dependency
+            # and works on all platforms (including Windows).
+            # For non-inline imported properties, use regular declaration but remove inline modifier.
+            # For local properties, use regular declaration with original modifiers.
+            is_inline_prop = entry.is_overridable
+            if is_linked_module:
+                # For LTO, export the function directly (not as function pointer)
+                # so consumer modules can call it directly for efficiency
+                storage_class = ""
+                dll_linkage = None
+                func_modifiers = entry.func_modifiers
+            elif is_inline_prop and not definition:
+                # For auto_cpdef properties in consumer modules, use function pointer
+                # that gets imported at module load time
+                storage_class = "static"
+                dll_linkage = None
+                type = CPtrType(type)
+                func_modifiers = [m for m in entry.func_modifiers if m != 'inline']
+            elif is_inline_prop and definition:
+                # For auto_cpdef properties in defining module, generate a regular
+                # declaration (not function pointer) so the function can be called
+                # from other functions in the same module before its definition
+                storage_class = "static"
+                dll_linkage = None
+                func_modifiers = [m for m in entry.func_modifiers if m != 'inline']
+            elif not definition:
+                # Non-inline imported properties: remove inline modifier so function is exported
+                func_modifiers = [m for m in entry.func_modifiers if m != 'inline']
+            else:
+                func_modifiers = entry.func_modifiers
+        elif entry.defined_in_pxd and not definition:
             storage_class = "static"
             dll_linkage = None
             type = CPtrType(type)

@@ -22,7 +22,7 @@ from . import Errors
 
 from .Visitor import VisitorTransform, TreeVisitor
 from .Visitor import CythonTransform, EnvTransform, ScopeTrackingTransform
-from .UtilNodes import LetNode, LetRefNode
+from .UtilNodes import CPropertySetNode, LetNode, LetRefNode
 from .TreeFragment import TreeFragment
 from .StringEncoding import EncodedString
 from .Errors import error, warning, CompileError, InternalError
@@ -1895,11 +1895,35 @@ class DecoratorTransform(ScopeTrackingTransform, SkipDeclarations):
 
     def visit_DefNode(self, node):
         scope_type = self.scope_type
+        # Check for property decorators before visit_FuncDefNode to avoid
+        # analyse_declarations() being called on the DefNode before conversion.
+        # When auto_cpdef converts DefNode to CFuncDefNode, the conversion must
+        # happen before any analysis so the entry is created in PropertyScope.
+        if scope_type == 'cclass' and node.decorators:
+            for decorator_node in node.decorators:
+                decorator = decorator_node.decorator
+                if decorator.is_name and decorator.name == 'property':
+                    return self._add_property(node, node.name, decorator_node)
+                elif decorator.is_attribute and decorator.attribute in ('getter', 'setter', 'deleter'):
+                    handler_name = self._map_property_attribute(decorator.attribute)
+                    if handler_name:
+                        prop_name = decorator.obj.name
+                        if prop_name in self._properties[-1]:
+                            if decorator.obj.name != node.name:
+                                error(decorator_node.pos,
+                                      "Mismatching property names, expected '%s', got '%s'" % (
+                                          decorator.obj.name, node.name))
+                                return node
+                            elif len(node.decorators) > 1:
+                                return self._reject_decorated_property(node, decorator_node)
+                            else:
+                                return self._add_to_property(node, handler_name, decorator_node)
+
         node = self.visit_FuncDefNode(node)
         if scope_type != 'cclass' or not node.decorators:
             return node
 
-        # transform @property decorators
+        # transform @property decorators (for cases not caught above)
         decorator_node = self._find_property_decorator(node)
         if decorator_node is not None:
             decorator = decorator_node.decorator
@@ -1930,6 +1954,54 @@ class DecoratorTransform(ScopeTrackingTransform, SkipDeclarations):
         decs = node.decorators
         node.decorators = None
         return self.chain_decorators(node, decs, node.name)
+
+    def _convert_property_to_cpdef(self, node, is_setter=False):
+        """Convert a property getter/setter DefNode to CFuncDefNode for auto_cpdef.
+
+        When auto_cpdef is enabled, converts eligible @property methods in @cclass
+        from DefNode to CFuncDefNode. The C function is NOT overridable (no skip_dispatch
+        parameter) - override checking is handled at the property accessor level.
+        """
+        auto_cpdef = self.current_directives.get('auto_cpdef')
+        if not auto_cpdef:
+            return node
+
+        # Check if this DefNode is compatible with cdef conversion
+        # (excluding the property check since we're handling property specially)
+        if node.needs_closure:
+            return node
+        if node.star_arg or node.starstar_arg:
+            return node
+        if node.num_required_args != len(node.args):
+            return node
+
+        # Convert to CFuncDefNode with overridable=False (property accessors don't use skip_dispatch)
+        # Add 'inline' modifier so the property is treated as a C property
+        # Setters must return void, getters return py_object_type (default)
+        from . import Nodes as NodesMod
+        from . import PyrexTypes
+
+        if is_setter:
+            # Create a simple wrapper that provides analyse_as_type() for void return type
+            class _VoidReturns:
+                """Wrapper for void return type in directive_returns."""
+                def __init__(self, pos):
+                    self.pos = pos
+                def analyse_as_type(self, env):
+                    return PyrexTypes.c_void_type
+
+            node = node.as_cfunction(
+                overridable=False, modifiers=['inline'], nogil=False, with_gil=False,
+                returns=_VoidReturns(node.pos),
+                except_val=None, has_explicit_exc_clause=False,
+                visibility='private')
+        else:
+            node = node.as_cfunction(
+                overridable=False, modifiers=['inline'], nogil=False, with_gil=False,
+                returns=node.return_type_annotation, except_val=None, has_explicit_exc_clause=False,
+                visibility='private')
+
+        return node
 
     def _find_property_decorator(self, node):
         properties = self._properties[-1]
@@ -1966,14 +2038,26 @@ class DecoratorTransform(ScopeTrackingTransform, SkipDeclarations):
         if len(node.decorators) > 1:
             return self._reject_decorated_property(node, decorator_node)
         node.decorators.remove(decorator_node)
+
+        # Track whether this is a true C property (cdef inline property)
+        # vs a Python property being converted to cpdef-style via auto_cpdef
+        is_true_cproperty = isinstance(node, Nodes.CFuncDefNode) and 'inline' in node.modifiers
+
+        # Convert DefNode getter to CFuncDefNode for auto_cpdef
+        if isinstance(node, Nodes.DefNode):
+            node = self._convert_property_to_cpdef(node)
+
         properties = self._properties[-1]
-        is_cproperty = isinstance(node, Nodes.CFuncDefNode)
+        # After conversion, node is CFuncDefNode but NOT a C property
+        # C properties use CPropertyNode, Python properties use PropertyNode
+        is_cproperty = is_true_cproperty
         body = Nodes.StatListNode(node.pos, stats=[node])
         node_type = Nodes.PropertyNode
         if is_cproperty:
-            if 'inline' not in node.modifiers:
-                error(node.pos, "C property method must be declared 'inline'")
             node_type = Nodes.CPropertyNode
+        elif isinstance(node, Nodes.CFuncDefNode) and 'inline' not in node.modifiers:
+            # C function with @property but no 'inline' modifier - error
+            error(node.pos, "C property method must be declared 'inline'")
         if name in properties:
             prop = properties[name]
             if prop.is_cproperty:
@@ -1994,11 +2078,20 @@ class DecoratorTransform(ScopeTrackingTransform, SkipDeclarations):
     def _add_to_property(self, node, name, decorator):
         properties = self._properties[-1]
         prop = properties[self._get_property_function_name(node)]
+
+        # Remove decorator before conversion (DefNode has decorators, CFuncDefNode doesn't)
+        if node.decorators:
+            node.decorators.remove(decorator)
+
         self._rename_property_function(node, name)
+
+        # Convert setter DefNode to CFuncDefNode for auto_cpdef
+        if isinstance(node, Nodes.DefNode):
+            node = self._convert_property_to_cpdef(node, is_setter=name == '__set__')
+
         if isinstance(node, Nodes.CFuncDefNode):
             if 'inline' not in node.modifiers:
                 error(node.pos, "C property method must be declared 'inline'")
-        node.decorators.remove(decorator)
         stats = prop.body.stats
         for i, stat in enumerate(stats):
             if self._get_property_function_name(stat) == name:
@@ -3071,6 +3164,13 @@ class ExpandInplaceOperators(EnvTransform):
             elif node.is_attribute:
                 obj, temps = side_effect_free_reference(node.obj, setting=setting)
                 return ExprNodes.AttributeNode(node.pos, obj=obj, attribute=node.attribute), temps
+            elif isinstance(node, CPropertySetNode):
+                setter_call = node.call_node
+                obj = setter_call.args[0]
+                obj, temps = side_effect_free_reference(obj, setting=True)
+                return ExprNodes.AttributeNode(
+                    node.pos, obj=obj,
+                    attribute=setter_call.function.name), temps
             elif isinstance(node, ExprNodes.BufferIndexNode):
                 raise ValueError("Don't allow things like attributes of buffer indexing operations")
             else:
@@ -3081,6 +3181,7 @@ class ExpandInplaceOperators(EnvTransform):
         except ValueError:
             return node
         dup = lhs.__class__(**lhs.__dict__)
+        dup = dup.analyse_types(env)
         binop = ExprNodes.binop_node(node.pos,
                                      operator = node.operator,
                                      operand1 = dup,
@@ -3089,7 +3190,6 @@ class ExpandInplaceOperators(EnvTransform):
         # Manually analyse types for new node.
         lhs.is_target = True
         lhs = lhs.analyse_target_types(env)
-        dup.analyse_types(env)  # FIXME: no need to reanalyse the copy, right?
         binop.analyse_operation(env)
         node = Nodes.SingleAssignmentNode(
             node.pos,
@@ -3327,6 +3427,7 @@ class AlignFunctionDefinitions(CythonTransform):
                 return None
             modifiers = [modifier for modifier in pxd_def.func_modifiers if modifier != 'inline']
             node = node.as_cfunction(pxd_def, modifiers=modifiers or None)
+            node.inline_in_pxd = 'inline' in pxd_def.func_modifiers
         # Enable this when nested cdef functions are allowed.
         # self.visitchildren(node)
         return node

@@ -1841,6 +1841,90 @@ class EarlyReplaceBuiltinCalls(Visitor.EnvTransform):
         )
         return node
 
+    def visit_AttributeNode(self, node):
+        self.visitchildren(node)
+        if self._is_c_base_property_access(node):
+            node = self._handle_simple_base_property_access(node)
+        return node
+
+    def _is_c_base_property_access(self, node):
+        # detect super().prop access where prop is a property on the base class
+        return (isinstance(node.obj, ExprNodes.CallNode)
+            and node.obj.function.is_name
+            and node.obj.function.name == 'super')
+
+    def _handle_simple_base_property_access(self, node):
+        # replace super().prop by a direct call to the base class property getter
+        class_node, class_scope = self.env_stack[-2]
+        if not isinstance(class_node, Nodes.CClassDefNode):
+            return node
+
+        base_type = class_node.base_type
+        if base_type is None or base_type.scope is None:
+            return node
+
+        # Look up the property in the base class scope
+        prop_entry = base_type.scope.lookup(node.attribute)
+        if not prop_entry or not prop_entry.is_property:
+            return node
+
+        # Check if this property has a C getter
+        property_scope = prop_entry.scope
+        if property_scope is None:
+            return node
+
+        getter_entry = property_scope.lookup_here("__get__")
+        if not getter_entry or not getter_entry.func_cname:
+            return node
+
+        # Get the current method scope to find 'self'
+        method_scope = self.current_env()
+        if not method_scope.arg_entries:
+            return node
+
+        self_arg = ExprNodes.NameNode(
+            node.pos, name=method_scope.arg_entries[0].name,
+            entry=method_scope.arg_entries[0])
+
+        # For LTO (Link Together Optimization), call the C function directly
+        # if the property is defined in a module being compiled together
+        is_lto = self.current_directives.get('lto', False)
+        if is_lto and getter_entry.func_cname:
+            # Check if the property's module is in the compilation sources
+            compilation_sources = method_scope.global_scope().compilation_sources
+            if compilation_sources:
+                prop_module_scope = prop_entry.scope
+                while prop_module_scope and not prop_module_scope.is_module_scope:
+                    prop_module_scope = prop_module_scope.outer_scope
+                if prop_module_scope and prop_module_scope.qualified_name in compilation_sources:
+                    return ExprNodes.SimpleCallNode.for_cproperty_get(
+                        node.pos, self_arg, prop_entry)
+
+        # For auto_cpdef properties (is_overridable=True), call the C function directly
+        # instead of using the vtable, since the function is exported and can be called
+        # directly from other modules in the same compilation.
+        is_auto_cpdef_property = getattr(getter_entry, 'is_overridable', False)
+        if is_auto_cpdef_property and getter_entry.func_cname:
+            return ExprNodes.SimpleCallNode.for_cproperty_get(
+                node.pos, self_arg, prop_entry)
+
+        # Only use vtable access for C properties (is_cproperty=True)
+        # Python properties don't have vtable entries
+        is_cproperty = getattr(prop_entry, 'is_cproperty', False)
+        if not is_cproperty:
+            return node
+
+        # Create a vtable-based call to the getter
+        # This works cross-module because the vtable pointer is retrieved via __Pyx_GetVtable
+        if base_type.vtabptr_cname:
+            vtable_call = "%s->%s" % (base_type.vtabptr_cname, getter_entry.cname)
+            function = ExprNodes.RawCNameExprNode(
+                node.pos, type=getter_entry.type, cname=vtable_call)
+            return ExprNodes.SimpleCallNode(node.pos, function=function, args=[self_arg])
+        else:
+            return ExprNodes.SimpleCallNode.for_cproperty_get(
+                node.pos, self_arg, prop_entry)
+
     def visit_GeneralCallNode(self, node):
         self.visitchildren(node)
         function = node.function
@@ -2304,6 +2388,129 @@ class InlineDefNodeCalls(Visitor.NodeRefCleanupMixin, Visitor.EnvTransform):
             generator_arg_tag=node.generator_arg_tag)
         if inlined.can_be_inlined():
             return self.replace(node, inlined)
+        return node
+
+
+class OptimizeCPropertyCalls(Visitor.NodeRefCleanupMixin, Visitor.EnvTransform):
+    """Optimize C property getter/setter calls to use direct C function calls.
+
+    C properties (cdef inline property) are accessed via SimpleCallNode which
+    goes through the generic function call mechanism. This transform detects
+    calls to C property getters/setters and replaces them with direct C
+    function calls using PythonCapiCallNode, avoiding the overhead of the
+    generic call mechanism.
+    """
+    visit_Node = Visitor.VisitorTransform.recurse_to_children
+
+    def visit_SimpleCallNode(self, node):
+        self.visitchildren(node)
+        function = node.function
+        if not function.is_name or not function.entry:
+            return node
+
+        entry = function.entry
+        # Check if this is a call to a C property getter/setter
+        # C property getters/setters are in a property scope and have is_cproperty set
+        if not entry.scope or not entry.scope.is_property_scope:
+            return node
+        if not entry.scope.parent_scope:
+            return node
+
+        # Verify this is actually a C property (has parent_type)
+        parent_type = entry.scope.parent_scope.parent_type
+        if not parent_type:
+            return node
+
+        # Get the property entry from the parent scope
+        property_name = entry.name  # __get__ or __set__
+        prop_entry = entry.scope.parent_scope.lookup_here(property_name)
+        if not prop_entry or not prop_entry.is_cproperty:
+            return node
+
+        # This is a C property getter/setter call - optimize it
+        return self._optimize_cproperty_call(node, prop_entry, entry)
+
+    def _optimize_cproperty_call(self, node, prop_entry, func_entry):
+        """Replace SimpleCallNode with direct C function call for C property access."""
+        pos = node.pos
+        obj = node.args[0] if node.args else None
+
+        if func_entry.name == '__get__':
+            # Property getter - return the result of calling the getter
+            getter_cname = func_entry.func_cname or func_entry.cname
+            if not getter_cname:
+                return node
+
+            # Get the getter function type
+            getter_type = func_entry.type
+            if not getter_type or not getter_type.is_cfunction:
+                return node
+
+            # Build the function type for PythonCapiCallNode
+            args = []
+            if obj:
+                args.append(
+                    ExprNodes.CFuncTypeArg("self", obj.type, None)
+                )
+
+            func_type = PyrexTypes.CFuncType(
+                getter_type.return_type,
+                args,
+                exception_value=getter_type.exception_value,
+                exception_check=getter_type.exception_check
+            )
+
+            # Create direct C function call
+            call_node = ExprNodes.PythonCapiCallNode(
+                pos,
+                getter_cname,
+                func_type,
+                args=[obj] if obj else [],
+                is_temp=node.is_temp,
+                may_return_none=getter_type.return_type.is_pyobject,
+            )
+            return call_node
+
+        elif func_entry.name == '__set__':
+            # Property setter - the call returns None (void)
+            # The value to set is passed via a special RawCNameExprNode
+            setter_cname = func_entry.func_cname or func_entry.cname
+            if not setter_cname:
+                return node
+
+            # For setters, we need to handle the special arg1 mechanism
+            # The setter signature is: setter(obj, value)
+            # The value is determined by the LHS of the assignment
+            if len(node.args) < 2:
+                return node
+
+            # Get the setter's second argument (the value)
+            # In CPropertySetNode, this is stored in arg1
+            setter_type = func_entry.type
+            if not setter_type or not setter_type.is_cfunction:
+                return node
+
+            # Build the function type for PythonCapiCallNode
+            func_type = PyrexTypes.CFuncType(
+                setter_type.return_type,
+                [
+                    ExprNodes.CFuncTypeArg("self", node.args[0].type, None),
+                    ExprNodes.CFuncTypeArg("value", node.args[1].type, None),
+                ],
+                exception_value=setter_type.exception_value,
+                exception_check=setter_type.exception_check
+            )
+
+            call_node = ExprNodes.PythonCapiCallNode(
+                pos,
+                setter_cname,
+                func_type,
+                args=[obj for obj in node.args[1:]],
+                is_temp=False,
+                result_is_used=False,
+            )
+            return call_node
+
         return node
 
 

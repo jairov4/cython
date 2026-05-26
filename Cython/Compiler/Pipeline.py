@@ -136,6 +136,9 @@ def inject_utility_code_stage_factory(context, internalise_c_class_entries=True)
                     if dep not in added:
                         utility_code_list.append(dep)
             if tree := utilcode.get_tree(cython_scope=context.cython_scope):
+                # Mark utility code function entries so they get declarations generated
+                for entry in tree.scope.cfunc_entries:
+                    entry.utility_code_definition = utilcode
                 module_node.merge_in(tree.with_compiler_directives(),
                                      tree.scope, stage="utility")
                 module_node.merge_scope(tree.scope, internalise_c_class_entries=internalise_c_class_entries)
@@ -168,7 +171,7 @@ def create_pipeline(context, mode, exclude_classes=()):
     from .AutoDocTransforms import EmbedSignature
     from .Optimize import FlattenInListTransform, SwitchTransform, IterationTransform
     from .Optimize import EarlyReplaceBuiltinCalls, OptimizeBuiltinCalls
-    from .Optimize import InlineDefNodeCalls
+    from .Optimize import InlineDefNodeCalls, OptimizeCPropertyCalls
     from .Optimize import ConstantFolding, FinalOptimizePhase
     from .Optimize import DropRefcountingTransform
     from .Optimize import ConsolidateOverflowCheck
@@ -221,6 +224,7 @@ def create_pipeline(context, mode, exclude_classes=()):
         IntroduceBufferAuxiliaryVars(context),
         _check_c_declarations,
         InlineDefNodeCalls(context),
+        OptimizeCPropertyCalls(context),
         AnalyseExpressionsTransform(context),
         FindInvalidUseOfFusedTypes(),
         ExpandInplaceOperators(context),

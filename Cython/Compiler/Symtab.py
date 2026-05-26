@@ -987,8 +987,11 @@ class Scope:
             entry.func_cname = cname
             entry.is_overridable = overridable
         if inline_in_pxd:
-            entry.inline_func_in_pxd = True
-        if in_pxd and visibility != 'extern' and not inline_in_pxd:
+            if defining:
+                # body in pxd: keep module-local static inline
+                entry.inline_func_in_pxd = True
+            # else: declaration only (body in .py/.pyx), fall through to defined_in_pxd
+        if in_pxd and visibility != 'extern' and not getattr(entry, 'inline_func_in_pxd', False):
             entry.defined_in_pxd = 1
         if api:
             entry.api = 1
@@ -1426,6 +1429,8 @@ class ModuleScope(Scope):
         self.namespace_cname = self.module_cname
         self._cached_tuple_types = {}
         self._cached_defaults_c_class_entries = {}
+        # Get compilation_sources from context for LTO
+        self.compilation_sources = context.compilation_sources if context else None
         self.process_include(Code.IncludeCode("Python.h", initial=True))
 
     def qualifying_scope(self):
@@ -3008,12 +3013,14 @@ class CppScopedEnumScope(Scope):
 
 
 class PropertyScope(Scope):
-    #  Scope holding the __get__, __set__ and __del__ methods for
+    #  Scope holding the __get__, __set__ and __Del__ methods for
     #  a property of an extension type.
     #
     #  parent_type   PyExtensionType   The type to which the property belongs
+    #  is_overridable  boolean         Set when auto_cpdef is enabled for this property
 
     is_property_scope = 1
+    is_overridable = False
 
     def __init__(self, name, class_scope):
         # outer scope is None for some internal properties
@@ -3021,6 +3028,14 @@ class PropertyScope(Scope):
         Scope.__init__(self, name, outer_scope, parent_scope=class_scope)
         self.parent_type = class_scope.parent_type
         self.directives = class_scope.directives
+
+    def handle_already_declared_name(self, name, cname, type, pos, visibility, copy_entry=False):
+        # Allow redeclarations of property accessor methods (__get__, __set__, __del__).
+        # This is needed because when auto_cpdef converts a DefNode property to CFuncDefNode,
+        # the entry may already exist from the original declaration.
+        if name in ('__get__', '__set__', '__del__'):
+            return self.entries[name]
+        return super().handle_already_declared_name(name, cname, type, pos, visibility, copy_entry)
 
     def declare_cfunction(self, name, type, pos, *args, **kwargs):
         """Declare a C property function.
@@ -3044,7 +3059,26 @@ class PropertyScope(Scope):
             type.args[0].type = self.parent_scope.parent_type
 
         entry = Scope.declare_cfunction(self, name, type, pos, *args, **kwargs)
-        entry.is_cproperty = True
+        # Set the signature to the property accessor signature for __get__, __set__, __del__
+        sig = get_property_accessor_signature(name)
+        if sig:
+            entry.signature = sig
+        if self.is_overridable:
+            entry.is_overridable = True
+        # When cimport_from_pyx is enabled, property getter/setter entries must be
+        # added to the module's cfunc_entries so they get declarations generated in
+        # consuming modules, and marked defined_in_pxd so they are treated as inline
+        # functions that are copied (static inline) into each compilation unit.
+        if Options.cimport_from_pyx:
+            entry.defined_in_pxd = 1
+            entry.used = 1
+            # Walk up from parent_scope (class scope) to find the module scope.
+            scope = self.parent_scope
+            while scope and not scope.is_module_scope:
+                scope = scope.outer_scope
+            if scope is not None:
+                if entry not in scope.cfunc_entries:
+                    scope.cfunc_entries.append(entry)
         return entry
 
     def declare_pyfunction(self, name, pos, allow_redefine=False):
@@ -3054,6 +3088,8 @@ class PropertyScope(Scope):
             entry = self.declare(name, name, py_object_type, pos, 'private')
             entry.is_special = 1
             entry.signature = signature
+            if self.is_overridable:
+                entry.is_overridable = True
             return entry
         else:
             error(pos, "Only __get__, __set__ and __del__ methods allowed "
