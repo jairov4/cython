@@ -291,3 +291,48 @@ def test_self_referential_ctor_swap():
     # Read both fields of the old object while building the new one.
     measure = Size2D(measure.height, measure.width)
     return (measure.width, measure.height)
+
+
+# ---------------------------------------------------------------------------
+# Final subclass overriding a base cpdef method with optional args.
+# Regression: the cpdef wrapper for the subclass __init__ was generating an
+# inherited vtable slot call with mismatched types (base* / BaseOptArgs* vs
+# derived* / DerivedOptArgs*) causing C++ compilation errors.
+# ---------------------------------------------------------------------------
+
+@cython.cclass
+class FinalBase:
+    x: object
+    y: object
+
+    def __init__(self, x, y=99):
+        self.x = x
+        self.y = y
+
+
+@cython.final
+@cython.cclass
+class FinalDerived(FinalBase):
+    z: object
+
+    def __init__(self, x, y=99, z=None):
+        super().__init__(x, y)
+        self.z = z
+
+
+def test_final_derived_required_only():
+    """
+    >>> test_final_derived_required_only()
+    ('a', 99, None)
+    """
+    obj = FinalDerived('a')
+    return (obj.x, obj.y, obj.z)
+
+
+def test_final_derived_all_args():
+    """
+    >>> test_final_derived_all_args()
+    ('a', 2, 'z')
+    """
+    obj = FinalDerived('a', 2, 'z')
+    return (obj.x, obj.y, obj.z)

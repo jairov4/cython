@@ -5167,7 +5167,24 @@ class OptimizeExtTypeConstructorCalls(Visitor.NodeRefCleanupMixin, Visitor.EnvTr
             # CastNode generates an explicit C cast (PyObject* → struct *) without
             # a runtime isinstance check; it satisfies C++ strict pointer typing.
             own_func_cname = ext_type.scope.mangle(Naming.func_prefix, '__init__')
-            if func_cname and func_cname == own_func_cname and same_module:
+            is_own_init = func_cname and func_cname == own_func_cname
+            # "truly own" mirrors _build_init_call_stat: not inherited, OR is a final
+            # cmethod whose func_cname was set to the subclass's own function.
+            is_truly_own = (not getattr(init_entry, 'is_inherited', False)
+                            or getattr(init_entry, 'is_final_cmethod', False))
+            # Check whether _build_init_call_stat will use a direct call (LTO path).
+            # Must mirror its logic to keep self_type_for_cast consistent with
+            # formal_self_type so that we don't generate an invalid downcast.
+            is_lto_direct = False
+            if is_truly_own and not same_module and self.current_directives.get('lto', False):
+                compilation_sources = self.current_env().global_scope().compilation_sources
+                type_module_scope = ext_type.scope
+                while type_module_scope and not type_module_scope.is_module_scope:
+                    type_module_scope = type_module_scope.outer_scope
+                if (compilation_sources and type_module_scope
+                        and type_module_scope.qualified_name in compilation_sources):
+                    is_lto_direct = True
+            if (is_own_init and same_module) or is_lto_direct:
                 self_type_for_cast = ext_type
             elif not same_module and getattr(init_entry, 'cname', None):
                 # Cross-module vtable slot depth determines the self type (same logic as
@@ -5262,28 +5279,67 @@ class OptimizeExtTypeConstructorCalls(Visitor.NodeRefCleanupMixin, Visitor.EnvTr
         orig_type = init_entry.type
         opt_count = orig_type.optional_arg_count
 
-        # Determine the self type that the C function (direct or vtable slot) actually
-        # declares.  For a non-inherited __init__ the self parameter is ext_type.
-        # For an inherited __init__ the vtable slot was typed using the base class
-        # self type (orig_type.args[0].type), which may differ from ext_type.  In C,
-        # passing a derived pointer where a base pointer is expected is implicitly OK;
-        # in C++ it requires an explicit cast, which result_as(formal_self_type)
-        # emits.  Using the correct type here avoids spurious C++ type errors.
-        # Determine the self type that the C function actually declares.
-        # Strategy: if func_cname is the function that ext_type's scope would
-        # generate for __init__, the function takes ext_type * as self.
-        # Otherwise (inherited direct call from a different class, or vtable slot),
-        # use orig_type.args[0].type — the type the function was originally declared
-        # with.  This avoids C++ pointer-type errors (C allows implicit struct-pointer
-        # conversions; C++ requires an explicit cast that result_as() emits).
+        # Determine the call target and whether it is a direct C-function call or a
+        # vtable-slot call.  These must agree with formal_self_type and op_arg_struct
+        # below, so compute them first.
+        #
+        # "own init" = func_cname matches the symbol ext_type's scope would generate for
+        # __init__.  Note: entry.is_inherited may be True even when ext_type redefines
+        # __init__ (the Entry was originally copied as inherited, then reused via
+        # same_c_signature_as for the subclass's own definition — entry.func_cname is
+        # set to the subclass function, making it unambiguously the type's own init).
         own_func_cname = ext_type.scope.mangle(Naming.func_prefix, '__init__')
-        if func_cname and func_cname == own_func_cname and same_module:
-            # Same-module own init: the C function's first parameter is ext_type*.
+
+        # Determine the call target and whether we use a direct C-function call
+        # or a vtable-slot call.  This must be decided first because formal_self_type
+        # and op_arg_struct must be consistent with it.
+        if same_module:
+            is_direct_call = True
+            c_target = func_cname
+        else:
+            is_direct_call = False
+            c_target = None
+            # LTO: the defining module is compiled together with this one, so
+            # the producer's __pyx_f_ symbol is non-static and a prototype is
+            # declared for cimported classes — call __init__ directly instead
+            # of through the vtable pointer.  Only for a non-inherited __init__:
+            # an entry with is_inherited=True but is_final_cmethod=True means
+            # ext_type reuses an inherited vtable slot, and its own func_cname is
+            # set to the subclass function; we can still call it directly.
+            # An entry with is_inherited=True and no is_final_cmethod is a purely
+            # inherited init whose __pyx_f_ symbol belongs to the base class TU,
+            # so we fall back to the vtable path for that case.
+            is_truly_own = (not getattr(init_entry, 'is_inherited', False)
+                            or getattr(init_entry, 'is_final_cmethod', False))
+            if (is_truly_own
+                    and self.current_directives.get('lto', False)
+                    and 'inline' not in (init_entry.func_modifiers or ())):
+                compilation_sources = env.global_scope().compilation_sources
+                type_module_scope = ext_type.scope
+                while type_module_scope and not type_module_scope.is_module_scope:
+                    type_module_scope = type_module_scope.outer_scope
+                if (compilation_sources and type_module_scope
+                        and type_module_scope.qualified_name in compilation_sources):
+                    is_direct_call = True
+                    c_target = (init_entry.func_cname
+                                or ext_type.scope.mangle(Naming.func_prefix, '__init__'))
+            if not is_direct_call:
+                vtabptr = getattr(ext_type, 'vtabptr_cname', None)
+                slot_cname = getattr(init_entry, 'cname', None)
+                if not (vtabptr and slot_cname):
+                    return None  # no vtable available; caller bails
+                c_target = "%s->%s" % (vtabptr, slot_cname)
+
+        # Determine the self type that the C function (or vtable slot) actually declares.
+        # - Direct call: self is ext_type* (the function was compiled for this type).
+        # - Vtable slot: the slot was typed for the ancestor that introduced __init__;
+        #   its depth in '__pyx_base.' prefixes tells us which ancestor.
+        # In C, passing a derived pointer where a base pointer is expected is implicitly
+        # OK; in C++ it requires an explicit cast, which result_as(formal_self_type) emits.
+        if is_direct_call:
             formal_self_type = ext_type
         elif not same_module and getattr(init_entry, 'cname', None):
-            # Cross-module vtable call: the slot lives in an ancestor's vtable section.
-            # '__pyx_base.__pyx___init__' has depth 1 → slot self type is the immediate
-            # parent; '__pyx_base.__pyx_base.__pyx___init__' depth 2 → grandparent, etc.
+            # Vtable slot: '__pyx_base.__pyx___init__' depth=1 → immediate parent, etc.
             depth = init_entry.cname.count(Naming.obj_base_cname + '.')
             formal_self_type = ext_type
             for _ in range(depth):
@@ -5295,6 +5351,7 @@ class OptimizeExtTypeConstructorCalls(Visitor.NodeRefCleanupMixin, Visitor.EnvTr
             formal_self_type = orig_type.args[0].type
         else:
             formal_self_type = ext_type
+
         # Use is_overridable=True so that c_call_code inserts __pyx_skip_dispatch
         # before the optional-args struct pointer — matching the actual C ABI:
         #   func(self, req1, ..., __pyx_skip_dispatch, __pyx_opt_args* opt)
@@ -5308,8 +5365,18 @@ class OptimizeExtTypeConstructorCalls(Visitor.NodeRefCleanupMixin, Visitor.EnvTr
             exception_value=orig_type.exception_value,
             exception_check=orig_type.exception_check,
             is_overridable=True)
-        if opt_count and orig_type.op_arg_struct:
-            call_type.op_arg_struct = orig_type.op_arg_struct
+        if opt_count:
+            # For a direct call to ext_type's own init, orig_type is the correct
+            # type (its op_arg_struct matches the function's ABI).
+            # For a vtable call the slot may have been declared using a base-class
+            # type (stored in entry.vtable_type after a final-type override), so use
+            # that type's op_arg_struct to avoid C++ struct-pointer mismatches.
+            if is_direct_call:
+                struct_type = orig_type
+            else:
+                struct_type = getattr(init_entry, 'vtable_type', None) or orig_type
+            if struct_type.op_arg_struct:
+                call_type.op_arg_struct = struct_type.op_arg_struct
         # Keep the identity of the called __init__ so the noexcept inference
         # can match this direct call against cross-module facts.
         call_type.entry = init_entry
@@ -5328,37 +5395,6 @@ class OptimizeExtTypeConstructorCalls(Visitor.NodeRefCleanupMixin, Visitor.EnvTr
 
         req_count = len(formal_params) - opt_count
         actual_opt_count = max(0, len(native_args) - req_count)
-
-        # For cross-module calls, the direct C function (`__pyx_f_...`) is only
-        # declared in the DEFINING module's translation unit.  The calling module
-        # does NOT see it via cimport; only the vtable pointer is guaranteed to be
-        # declared (via __Pyx_GetVtable).  Use the vtable slot in that case.
-        if same_module:
-            c_target = func_cname
-        else:
-            c_target = None
-            # LTO: the defining module is compiled together with this one, so
-            # the producer's __pyx_f_ symbol is non-static and a prototype is
-            # declared for cimported classes — call __init__ directly instead
-            # of through the vtable pointer.  Only for a non-inherited
-            # __init__ (the symbol belongs to ext_type itself).
-            if (self.current_directives.get('lto', False)
-                    and not getattr(init_entry, 'is_inherited', False)
-                    and 'inline' not in (init_entry.func_modifiers or ())):
-                compilation_sources = env.global_scope().compilation_sources
-                type_module_scope = ext_type.scope
-                while type_module_scope and not type_module_scope.is_module_scope:
-                    type_module_scope = type_module_scope.outer_scope
-                if (compilation_sources and type_module_scope
-                        and type_module_scope.qualified_name in compilation_sources):
-                    c_target = (init_entry.func_cname
-                                or ext_type.scope.mangle(Naming.func_prefix, '__init__'))
-            if not c_target:
-                vtabptr = getattr(ext_type, 'vtabptr_cname', None)
-                slot_cname = getattr(init_entry, 'cname', None)
-                if not (vtabptr and slot_cname):
-                    return None  # no vtable available; caller bails
-                c_target = "%s->%s" % (vtabptr, slot_cname)
 
         call = ExprNodes.PythonCapiCallNode(
             pos, c_target, call_type,

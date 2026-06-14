@@ -8426,7 +8426,7 @@ class AttributeNode(ExprNode):
     def _create_unbound_cmethod_entry(self, type, entry, env):
         # Create a temporary entry describing the unbound C method in `entry`
         # as an ordinary function.
-        if entry.func_cname and entry.type.op_arg_struct is None:
+        if entry.func_cname and (entry.type.op_arg_struct is None or entry.is_final_cmethod):
             cname = entry.func_cname
             if entry.type.is_static_method or (
                     env.parent_scope and env.parent_scope.is_cpp_class_scope):
