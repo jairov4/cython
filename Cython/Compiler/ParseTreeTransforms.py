@@ -3734,7 +3734,12 @@ class AdjustDefByDirectives(CythonTransform, SkipDeclarations):
                 # CFuncDeclaratorNode.analyse).
                 node.declarator.synthesized_exc_clause = True
             self.directives['auto_cpdef'] = False  # avoid auto_cpdef nested methods
+            # Inner functions inside a promoted method are not class methods;
+            # clear in_value_class so they don't get incorrectly promoted.
+            old_in_value_class = self.in_value_class
+            self.in_value_class = False
             node = self.visit(node)
+            self.in_value_class = old_in_value_class
             self.directives['auto_cpdef'] = auto_cpdef
             return node
         if is_cfunc:
@@ -3747,7 +3752,10 @@ class AdjustDefByDirectives(CythonTransform, SkipDeclarations):
                     returns=return_type_node, except_val=except_val, has_explicit_exc_clause=has_explicit_exc_clause,
                     visibility=visibility)
                 self.directives['auto_cpdef'] = False
+                old_in_value_class = self.in_value_class
+                self.in_value_class = False
                 node = self.visit(node)
+                self.in_value_class = old_in_value_class
                 self.directives['auto_cpdef'] = auto_cpdef
                 return node
         if 'inline' in modifiers:
@@ -3758,7 +3766,13 @@ class AdjustDefByDirectives(CythonTransform, SkipDeclarations):
         if with_gil:
             error(node.pos, "Python functions cannot be declared 'with_gil'")
         self.directives["auto_cpdef"] = False
+        # Don't let nested inner functions see in_value_class: the value-type
+        # cpdef promotion only applies to direct methods of the class, not to
+        # inner functions defined inside those methods.
+        old_in_value_class = self.in_value_class
+        self.in_value_class = False
         self.visit_FuncDefNode(node)
+        self.in_value_class = old_in_value_class
         self.directives["auto_cpdef"] = auto_cpdef
         return node
 

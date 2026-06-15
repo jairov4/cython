@@ -3953,7 +3953,6 @@ class DefNode(FuncDefNode):
             return False
         if self.star_arg or self.starstar_arg:
             return False
-
         is_property = False
         from . import ExprNodes
         if self.decorators:
@@ -6757,19 +6756,15 @@ class CClassDefNode(ClassDefNode):
             # because dataclass_fields metadata is not populated until that later transform.
             if getattr(scope, 'is_value_class_scope', False):
                 value_fields_ok = True
-                for entry in scope.var_entries:
-                    etype = entry.type
-                    if etype.is_pyobject or etype.needs_refcounting or etype.is_memoryviewslice:
-                        value_fields_ok = False
-                        error(entry.pos,
-                              "value_type field '%s' must be a C type "
-                              "(int/float/bool/enum/ctuple/nested value type), "
-                              "not a Python object" % entry.name)
+                # v3: object/str/list fields are now allowed (they make the struct
+                # refcounted).  Only truly unsupported types remain errors.
                 if scope.lookup_here("__dict__") or scope.lookup_here("__weakref__"):
+                    value_fields_ok = False
                     error(self.pos,
                           "value_type classes cannot have __dict__ or __weakref__")
                 for dunder in ('__post_init__', '__cinit__', '__dealloc__'):
                     if scope.lookup_here(dunder):
+                        value_fields_ok = False
                         error(self.pos,
                               "value_type classes cannot define %s" % dunder)
 
@@ -6878,7 +6873,9 @@ class CClassDefNode(ClassDefNode):
             field_cname = entry.cname
             value_scope.declare_var(
                 entry.name, entry.type, entry.pos,
-                cname=field_cname, is_cdef=True)
+                cname=field_cname, is_cdef=True,
+                # Value class structs may hold Python objects and refcounted types (v3).
+                allow_pyobject=True, allow_memoryview=True, allow_refcounted=True)
             entry.cname = "%s.%s" % (Naming.value_member_cname, field_cname)
 
         # Reorder type_entries so the value struct is emitted AFTER any member
@@ -8426,7 +8423,10 @@ class DelStatNode(StatNode):
     def analyse_expressions(self, env):
         for i, arg in enumerate(self.args):
             arg = self.args[i] = arg.analyse_target_expression(env, None)
-            if arg.type.is_pyobject or (arg.is_name and arg.type.is_memoryviewslice):
+            if (arg.type.is_pyobject
+                    or (arg.is_name and arg.type.is_memoryviewslice)
+                    or (arg.is_name and getattr(arg.type, 'is_value_class', False)
+                        and arg.type.needs_refcounting)):
                 if arg.is_name and arg.entry.is_cglobal:
                     error(arg.pos, "Deletion of global C variable")
             elif arg.type.is_ptr and arg.type.base_type.is_cpp_class:
@@ -8452,7 +8452,9 @@ class DelStatNode(StatNode):
         for arg in self.args:
             if (arg.type.is_pyobject or
                     arg.type.is_memoryviewslice or
-                    arg.is_subscript and arg.base.type.is_pybytearray_type):
+                    arg.is_subscript and arg.base.type.is_pybytearray_type or
+                    (arg.is_name and getattr(arg.type, 'is_value_class', False)
+                     and arg.type.needs_refcounting)):
                 arg.generate_deletion_code(
                     code, ignore_nonexisting=self.ignore_nonexisting)
             elif arg.type.is_ptr and arg.type.base_type.is_cpp_class:

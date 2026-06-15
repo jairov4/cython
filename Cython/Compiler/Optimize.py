@@ -4982,6 +4982,14 @@ class OptimizeExtTypeConstructorCalls(Visitor.NodeRefCleanupMixin, Visitor.EnvTr
             # No cpdef __init__: only optimize zero-arg calls (tp_new only, no init).
             if native_args:
                 return None
+            # Only safe to skip __init__ when the type is defined in the same module —
+            # for cross-module (cimported) types we only see the .pxd scope, which may
+            # not declare a Python-level `def __init__` that initialises critical
+            # attributes (e.g. StringIOTree.stream).  Skip the optimisation in that case
+            # to avoid leaving attributes at their NULL defaults.
+            same_module = ext_type.scope.global_scope() is env.global_scope()
+            if not same_module:
+                return None
             # Guard: if any base class defines __init__ we must NOT skip tp_init —
             # the inherited __init__ would initialise C fields that tp_new leaves at zero.
             # (In auto_cpdef mode the inherited cpdef __init__ IS in cfunc_entries and
@@ -4992,7 +5000,6 @@ class OptimizeExtTypeConstructorCalls(Visitor.NodeRefCleanupMixin, Visitor.EnvTr
                 if t.scope.lookup_here('__init__'):
                     return None
                 t = getattr(t, 'base_type', None)
-            same_module = ext_type.scope.global_scope() is env.global_scope()
 
         return rhs.pos, ext_type, init_entry, func_cname, native_args, same_module
 

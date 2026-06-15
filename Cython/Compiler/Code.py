@@ -3093,6 +3093,12 @@ class CCodeWriter:
         elif entry.type.is_pyobject:
             self.put(" = NULL")
         self.putln(";")
+        if (entry.init is None and not entry.type.is_pyobject
+                and getattr(entry.type, 'is_value_class', False)
+                and entry.type.needs_refcounting):
+            # Zero-initialise so that XDECREF at scope exit or on first read
+            # doesn't chase garbage pointers in the object fields.
+            self.putln("memset(&%s, 0, sizeof(%s));" % (entry.cname, entry.cname))
         self.globalstate.use_entry_utility_code(entry)
 
     def put_temp_declarations(self, func_context: FunctionState):
@@ -3105,6 +3111,11 @@ class CCodeWriter:
                 self.putln("%s = NULL;" % decl)
             elif type.is_memoryviewslice:
                 self.putln("%s = %s;" % (decl, type.literal_code(type.default_value)))
+            elif getattr(type, 'is_value_class', False) and type.needs_refcounting:
+                # Zero-initialise so that XDECREF on exception paths doesn't
+                # chase garbage pointers in the struct's object fields.
+                self.putln("%s%s; memset(&%s, 0, sizeof(%s));" % (
+                    static and "static " or "", decl, name, name))
             else:
                 self.putln("%s%s;" % (static and "static " or "", decl))
 

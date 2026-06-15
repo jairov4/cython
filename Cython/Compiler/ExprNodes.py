@@ -830,7 +830,8 @@ class ExprNode(Node):
         if not type.is_void:
             if type.is_pyobject:
                 type = PyrexTypes.py_object_type
-            elif not (self.result_is_used or type.is_memoryviewslice or self.is_c_result_required()):
+            elif not (self.result_is_used or type.is_memoryviewslice
+                      or type.needs_refcounting or self.is_c_result_required()):
                 self.temp_code = None
                 return
             self.temp_code = code.funcstate.allocate_temp(
@@ -930,6 +931,11 @@ class ExprNode(Node):
             elif self.type.is_memoryviewslice:
                 code.putln("%s.memview = NULL;" % self.result())
                 code.putln("%s.data = NULL;" % self.result())
+            elif getattr(self.type, 'is_value_class', False) and self.type.needs_refcounting:
+                # Clear all fields to NULL so the subsequent disposal is a no-op
+                # (mirrors 'cname = 0' for pyobject after a value has been moved out).
+                code.putln("memset(&%s, 0, sizeof(%s));" % (
+                    self.result(), self.result()))
 
             if self.has_temp_moved:
                 code.globalstate.use_utility_code(
@@ -1204,13 +1210,24 @@ class ExprNode(Node):
         elif type.is_ctuple:
             bool_value = len(type.components) == 0
             return BoolNode(self.pos, value=bool_value)
+        elif getattr(type, 'is_value_class', False):
+            if type.scope and type.scope.lookup("__bool__"):
+                return SimpleCallNode(
+                    self.pos,
+                    function=AttributeNode(
+                        self.pos, obj=self, attribute=StringEncoding.EncodedString('__bool__')),
+                    args=[]).analyse_types(env)
+            # No __bool__: box and use Python truth-testing.
+            return self.coerce_to_pyobject(env).coerce_to_boolean(env)
         else:
             error(self.pos, "Type '%s' not acceptable as a boolean" % type)
             return self
 
     def coerce_to_index(self, env):
         # If not already some C integer type, coerce to Py_ssize_t.
-        return self if self.type.is_int else self.coerce_to(PyrexTypes.c_py_ssize_t_type, env)
+        if self.type.is_int:
+            return self
+        return self.coerce_to(PyrexTypes.c_py_ssize_t_type, env)
 
     def coerce_to_temp(self, env):
         #  Ensure that the result is in a temporary.
@@ -2217,6 +2234,20 @@ class NameNode(AtomicExprNode):
                     node.entry = var_entry
                     node.analyse_rvalue_entry(env)
                     return node
+                # Unbound cpdef classmethod: rebuild as Python attribute access so
+                # that keyword arguments and defaults are handled via the descriptor.
+                if (getattr(entry, 'is_unbound_cmethod', False) and
+                        getattr(entry.type, 'is_classmethod', False) and
+                        getattr(entry, 'classmethod_obj', None) is not None):
+                    obj = entry.classmethod_obj.analyse_types(env)
+                    if not obj.type.is_pyobject:
+                        obj = obj.coerce_to_pyobject(env)
+                    attr_node = AttributeNode(
+                        self.pos,
+                        obj=obj,
+                        attribute=StringEncoding.EncodedString(entry.classmethod_attr))
+                    attr_node.analyse_as_python_attribute(env)
+                    return attr_node
 
         return super().coerce_to(dst_type, env)
 
@@ -2756,7 +2787,26 @@ class NameNode(AtomicExprNode):
             if self.type.is_const:
                 # Const variables are assigned when declared
                 assigned = True
-            if self.type.is_pyobject:
+            if (getattr(self.type, 'is_value_class', False)
+                    and self.type.needs_refcounting
+                    and self.use_managed_ref):
+                # Refcounted value class: mirror the pyobject owned-reference path.
+                # INCREF the rhs fields (so both rhs and future lhs own a reference
+                # to each PyObject* field), then copy struct to lhs (and DECREF old
+                # lhs if it was already initialized).
+                rhs.make_owned_reference(code)
+                assigned = True
+                if not self.cf_is_null:
+                    if self.cf_maybe_null:
+                        self.generate_xdecref_set(code, rhs.result_as(self.ctype()))
+                    else:
+                        self.generate_decref_set(code, rhs.result_as(self.ctype()))
+                else:
+                    # First assignment to this variable: no old value to DECREF.
+                    # The INCREF from make_owned_reference will be owned by lhs.
+                    # Fall through to the plain struct copy below (assigned=False).
+                    assigned = False
+            elif self.type.is_pyobject:
                 #print "NameNode.generate_assignment_code: to", self.name ###
                 #print "...from", rhs ###
                 #print "...LHS type", self.type, "ctype", self.ctype() ###
@@ -2876,7 +2926,9 @@ class NameNode(AtomicExprNode):
                     '}' % (del_code, code.error_goto(self.pos)))
             else:
                 code.put_error_if_neg(self.pos, del_code)
-        elif self.entry.type.is_pyobject or self.entry.type.is_memoryviewslice:
+        elif (self.entry.type.is_pyobject or self.entry.type.is_memoryviewslice
+              or (getattr(self.entry.type, 'is_value_class', False)
+                  and self.entry.type.needs_refcounting)):
             if not self.cf_is_null:
                 if self.cf_maybe_null and not ignore_nonexisting:
                     code.put_error_if_unbound(self.pos, self.entry, self.in_nogil_context)
@@ -7788,10 +7840,13 @@ class GeneralCallNode(CallNode):
                 elif (self.function.entry.as_variable or
                         (self.function.entry.is_cmethod and
                          (self.function.entry.is_overridable or
-                          getattr(self.function.type, 'is_overridable', False)))):
+                          getattr(self.function.type, 'is_overridable', False))) or
+                        (getattr(self.function.entry, 'is_unbound_cmethod', False) and
+                         getattr(self.function.type, 'is_classmethod', False))):
                     # Fall back to Python dispatch. AttributeNode.coerce_to handles both
                     # directly-defined cpdef (is_cfunction+as_variable) and inherited cpdef
                     # (is_cmethod+is_overridable, as_variable=None) via analyse_as_python_attribute.
+                    # Unbound classmethods always have a Python descriptor for keyword dispatch.
                     self.function = self.function.coerce_to_pyobject(env)
                 elif node is self:
                     error(self.pos,
@@ -7836,8 +7891,11 @@ class GeneralCallNode(CallNode):
         pos_args = self.positional_args.args
         kwargs = self.keyword_args
         declared_args = function_type.args
-        if entry.is_cmethod:
-            declared_args = declared_args[1:]  # skip 'self'
+        _is_unbound_classmethod = (
+            getattr(entry, 'is_unbound_cmethod', False) and
+            getattr(function_type, 'is_classmethod', False))
+        if entry.is_cmethod or _is_unbound_classmethod:
+            declared_args = declared_args[1:]  # skip 'self' / 'cls'
 
         if len(pos_args) > len(declared_args):
             error(self.pos, "function call got too many positional arguments, "
@@ -7892,10 +7950,12 @@ class GeneralCallNode(CallNode):
                         first_missing_keyword = name
                     continue
                 elif first_missing_keyword:
-                    if entry.as_variable or (entry.is_cmethod and function_type.is_overridable):
+                    if (entry.as_variable or (entry.is_cmethod and function_type.is_overridable)
+                            or _is_unbound_classmethod):
                         # Fall back to a Python call: either the function has a Python
                         # form (as_variable), or it is an inherited cpdef whose
                         # as_variable is None but that still has a Python wrapper.
+                        # Classmethods always have a Python descriptor for keyword dispatch.
                         # We only support optional arguments at the end in the C ABI,
                         # so gaps in keyword args require Python dispatch.
                         return self
@@ -8456,6 +8516,11 @@ class AttributeNode(ExprNode):
         ubcm_entry.func_cname = entry.func_cname
         ubcm_entry.is_unbound_cmethod = 1
         ubcm_entry.scope = entry.scope
+        if getattr(ctype, 'is_classmethod', False):
+            # Store the class object expression so Python fallback can reconstruct
+            # an AttributeNode for keyword dispatch (e.g. Class.method(kw=v)).
+            ubcm_entry.classmethod_obj = self.obj
+            ubcm_entry.classmethod_attr = self.attribute
         return ubcm_entry
 
     def analyse_as_type(self, env):
@@ -10547,6 +10612,19 @@ class DictNode(ExprNode):
                     code.putln(f"memcpy({self.result()}.{key_cname}, {value_cname}, sizeof({value_cname}));")
                 else:
                     code.putln(f"{self.result()}.{key_cname} = {value_cname};")
+                # For refcounted value class fields, the struct takes ownership:
+                # INCREF the object fields so that subsequent disposal of the arg
+                # temp doesn't steal the struct's reference.
+                if getattr(self.type, 'is_value_class', False) and self.type.needs_refcounting:
+                    mtype = member.type
+                    if mtype.is_pyobject:
+                        code.putln("Py_XINCREF(%s.%s);" % (self.result(), key_cname))
+                    elif getattr(mtype, 'is_value_class', False) and mtype.needs_refcounting:
+                        code.putln("%s(&%s.%s);" % (
+                            mtype._refcount_incref_fname, self.result(), key_cname))
+                    elif mtype.is_memoryviewslice:
+                        code.putln("__PYX_INC_MEMVIEW(&%s.%s, 1);" % (
+                            self.result(), key_cname))
             item.generate_disposal_code(code)
             item.free_temps(code)
 
@@ -13098,6 +13176,17 @@ _UNOP_TO_DUNDER = {
     '+': '__pos__',
     '~': '__invert__',
 }
+# Reflected (right-hand) versions of the binary dunders, for dispatching
+# value_type.__rmul__ etc. when the left operand is not a value type.
+_REFLECTED_BINOP_DUNDERS = {
+    '__add__': '__radd__',
+    '__sub__': '__rsub__',
+    '__mul__': '__rmul__',
+    '__truediv__': '__rtruediv__',
+    '__floordiv__': '__rfloordiv__',
+    '__mod__': '__rmod__',
+    '__matmul__': '__rmatmul__',
+}
 _RICHCMP_TO_DUNDER = {
     '==': '__eq__',
     '!=': '__ne__',
@@ -13222,8 +13311,16 @@ def _lookup_cpdef_dunder(type1, dunder_name, operand2_type=None):
             return None
         # Check operand type compatibility for binary ops.
         if operand2_type is not None and len(entry.type.args) >= 2:
-            if not entry.type.args[1].type.assignable_from(operand2_type):
-                return None
+            formal = entry.type.args[1].type
+            if not formal.assignable_from(operand2_type):
+                # Also accept PyExtensionType ↔ CValueClassType equivalence.
+                # This arises when a forward-referenced value_type class in a
+                # cross-type method annotation (e.g. datetime.__add__(other: timedelta)
+                # where timedelta is defined later in the same file) resolved to
+                # the boxed PyExtensionType before equivalent_type was set.
+                vc = _value_class_of(operand2_type)
+                if vc is None or not formal.same_as(vc.boxed_type):
+                    return None
     return entry
 
 
@@ -13259,26 +13356,39 @@ class BinopNode(ExprNode):
             self.compile_time_value_error(e)
 
     def _cpdef_dunder_entry(self, env):
-        """Return a cpdef entry if this binop can be dispatched as a direct C call."""
+        """Return a (entry, dunder_name, reflected) tuple if this binop can be dispatched
+        as a direct C call, else (None, None, False).
+
+        reflected=True means the entry is on operand2 (e.g. timedelta.__rmul__ for int*timedelta)
+        and the call should be rewritten as operand2.dunder(operand1).
+        """
         op = self.operator
         dunder = (_INPLACE_BINOP_TO_DUNDER if self.inplace else {}).get(op) or _BINOP_TO_DUNDER.get(op)
         if not dunder:
-            return None, None
+            return None, None, False
         type1 = _safe_infer_type(self.operand1, env)
         type2 = _safe_infer_type(self.operand2, env)
         entry = _lookup_cpdef_dunder(type1, dunder, type2)
         if entry is not None:
-            return entry, dunder
+            return entry, dunder, False
         # For inplace, also try the non-inplace dunder.
         if self.inplace and op in _BINOP_TO_DUNDER:
             regular = _BINOP_TO_DUNDER[op]
             entry = _lookup_cpdef_dunder(type1, regular, type2)
             if entry is not None:
-                return entry, regular
-        return None, None
+                return entry, regular, False
+        # Try reflected dunder on operand2 when operand1 is not a value type
+        # (e.g. int * timedelta → timedelta.__rmul__(int)).
+        if not self.inplace and _value_class_of(type2) is not None and _value_class_of(type1) is None:
+            reflected = _REFLECTED_BINOP_DUNDERS.get(dunder)
+            if reflected:
+                entry = _lookup_cpdef_dunder(type2, reflected, type1)
+                if entry is not None:
+                    return entry, reflected, True
+        return None, None, False
 
     def infer_type(self, env):
-        entry, dunder = self._cpdef_dunder_entry(env)
+        entry, dunder, _reflected = self._cpdef_dunder_entry(env)
         if entry is not None:
             return entry.type.return_type
         t1 = self.operand1.infer_type(env)
@@ -13297,17 +13407,29 @@ class BinopNode(ExprNode):
         t = self.result_type(t1, t2, env)
         return t if t is not None else py_object_type
 
+    def _make_cpdef_dunder_call(self, entry, dunder, reflected):
+        """Build a SimpleCallNode for the cpdef dunder dispatch.
+
+        reflected=True means the entry is on operand2 (e.g. timedelta.__rmul__
+        for int*timedelta), so obj=operand2 and arg=operand1.
+        """
+        if reflected:
+            obj, arg = self.operand2, self.operand1
+        else:
+            obj, arg = self.operand1, self.operand2
+        return SimpleCallNode(self.pos,
+            function=AttributeNode(self.pos, obj=obj,
+                                   attribute=StringEncoding.EncodedString(dunder)),
+            args=[arg])
+
     def analyse_types(self, env):
-        entry, dunder = self._cpdef_dunder_entry(env)
+        entry, dunder, reflected = self._cpdef_dunder_entry(env)
         if entry is not None:
-            # Rewrite as an attribute method call: operand1.dunder(operand2).
+            # Rewrite as an attribute method call: operand1.dunder(operand2)
+            # (or operand2.dunder(operand1) for reflected dunders).
             # SimpleCallNode/AttributeNode handle coercion, exception spec, and
             # direct final_func_cname dispatch for free.
-            call = SimpleCallNode(self.pos,
-                function=AttributeNode(self.pos, obj=self.operand1,
-                                       attribute=StringEncoding.EncodedString(dunder)),
-                args=[self.operand2])
-            return call.analyse_types(env)
+            return self._make_cpdef_dunder_call(entry, dunder, reflected).analyse_types(env)
         self.operand1 = self.operand1.analyse_types(env)
         self.operand2 = self.operand2.analyse_types(env)
         # Value-class operands only resolve to their value-struct type AFTER the
@@ -13315,14 +13437,16 @@ class BinopNode(ExprNode):
         # object pre-analysis).  Retry the cpdef-dunder rewrite now that the
         # operand .type is set, so `a + b` on two value structs dispatches the
         # direct value-ABI call instead of failing analyse_c_operation.
-        if _value_class_of(self.operand1.type) is not None:
-            entry, dunder = self._cpdef_dunder_entry(env)
+        if (_value_class_of(self.operand1.type) is not None
+                or _value_class_of(self.operand2.type) is not None):
+            entry, dunder, reflected = self._cpdef_dunder_entry(env)
             if entry is not None:
-                call = SimpleCallNode(self.pos,
-                    function=AttributeNode(self.pos, obj=self.operand1,
-                                           attribute=StringEncoding.EncodedString(dunder)),
-                    args=[self.operand2])
-                return call.analyse_types(env)
+                return self._make_cpdef_dunder_call(entry, dunder, reflected).analyse_types(env)
+            # No cpdef dunder (e.g. untyped def method): box value types and use Python dispatch.
+            if _value_class_of(self.operand1.type) is not None:
+                self.operand1 = self.operand1.coerce_to_pyobject(env)
+            if _value_class_of(self.operand2.type) is not None:
+                self.operand2 = self.operand2.coerce_to_pyobject(env)
         return self.analyse_operation(env)
 
     def analyse_operation(self, env):
@@ -13566,7 +13690,7 @@ class NumBinopNode(BinopNode):
         # A cpdef dunder (e.g. Vec2.__add__ returning Vec2) takes priority: the
         # binop will be rewritten to a direct C call in analyse_types, so its
         # inferred type must match the dunder's return type.
-        entry, dunder = self._cpdef_dunder_entry(env)
+        entry, dunder, _reflected = self._cpdef_dunder_entry(env)
         if entry is not None:
             return entry.type.return_type
         type1 = self.operand1.infer_type(env)
@@ -13894,14 +14018,18 @@ class MulNode(NumBinopNode):
 
         # Value-class operands: dispatch through cpdef dunder before the
         # sequence-mul and numeric paths, which cannot handle struct types.
-        if not self.is_sequence_mul and _value_class_of(self.operand1.type) is not None:
-            entry, dunder = self._cpdef_dunder_entry(env)
+        # Also handles reflected dunders (e.g. int * timedelta → timedelta.__rmul__(int)).
+        if not self.is_sequence_mul and (
+                _value_class_of(self.operand1.type) is not None
+                or _value_class_of(self.operand2.type) is not None):
+            entry, dunder, reflected = self._cpdef_dunder_entry(env)
             if entry is not None:
-                call = SimpleCallNode(self.pos,
-                    function=AttributeNode(self.pos, obj=self.operand1,
-                                           attribute=StringEncoding.EncodedString(dunder)),
-                    args=[self.operand2])
-                return call.analyse_types(env)
+                return self._make_cpdef_dunder_call(entry, dunder, reflected).analyse_types(env)
+            # No cpdef dunder: box value types and use Python dispatch.
+            if _value_class_of(self.operand1.type) is not None:
+                self.operand1 = self.operand1.coerce_to_pyobject(env)
+            if _value_class_of(self.operand2.type) is not None:
+                self.operand2 = self.operand2.coerce_to_pyobject(env)
 
         # TODO: we could also optimise the case of "[...] * 2 * n", i.e. with an existing 'mult_factor'
         if self.is_sequence_mul:
@@ -14716,6 +14844,21 @@ class CondExprNode(ExprNode):
     def analyse_result_type(self, env):
         true_val_type = self.true_val.type
         false_val_type = self.false_val.type
+        # value_type: in a value_type method, `self` has type T* (pointer to
+        # struct), but expressions like `-self` return T (struct by value).
+        # Auto-deref the pointer branch so both branches have the same value type.
+        if (true_val_type.is_ptr
+                and getattr(true_val_type.base_type, 'is_value_class', False)
+                and true_val_type.base_type.same_as(false_val_type)):
+            deref = DereferenceNode(self.true_val.pos, operand=self.true_val)
+            self.true_val = deref.analyse_types(env)
+            true_val_type = self.true_val.type
+        elif (false_val_type.is_ptr
+                and getattr(false_val_type.base_type, 'is_value_class', False)
+                and false_val_type.base_type.same_as(true_val_type)):
+            deref = DereferenceNode(self.false_val.pos, operand=self.false_val)
+            self.false_val = deref.analyse_types(env)
+            false_val_type = self.false_val.type
         self.type = PyrexTypes.independent_spanning_type(true_val_type, false_val_type)
 
         if self.type.is_reference:
@@ -15173,6 +15316,23 @@ class CmpNode:
         else:
             type1 = operand1.type
             type2 = operand2.type
+
+            # Value-type comparison: the cpdef dunder entry was stored during
+            # analyse_types (both cascaded and non-cascaded paths).
+            vc_entry = getattr(self, '_vc_cmp_entry', None)
+            if vc_entry is not None:
+                # Signature: func(self_ptr, other_val, skip_dispatch=1)
+                # For cross-module cimport entries func_cname is not set (only
+                # set at definition site); derive it from the scope mangling.
+                vc_func_cname = vc_entry.func_cname or (
+                    vc_entry.scope and vc_entry.scope.mangle(Naming.func_prefix, vc_entry.name))
+                if vc_func_cname:
+                    self_arg = operand1.result() if type1.is_ptr else "&(%s)" % operand1.result()
+                    other_arg = "(*(%s))" % operand2.result() if type2.is_ptr else operand2.result()
+                    code.putln("%s = %s(%s, %s, 1);" % (
+                        result_code, vc_func_cname, self_arg, other_arg))
+                    return
+
             if (type1.is_extension_type or type2.is_extension_type) \
                     and not type1.same_as(type2):
                 common_type = py_object_type
@@ -15322,7 +15482,15 @@ class PrimaryCmpNode(ExprNode, CmpNode):
                         arg2_type is py_object_type
                         and type2.is_extension_type
                         and type1.assignable_from(type2))
-                    if typed_arg2_ok or untyped_same_type_ok:
+                    # Case C: value_type dunder -- arg2_type is a CValueClassType
+                    # (not an extension type).  Accept if the operand is the same
+                    # value class (or a pointer to it, i.e. 'self' in a value method).
+                    value_class_ok = (
+                        arg2_type is not None
+                        and getattr(arg2_type, 'is_value_class', False)
+                        and (_value_class_of(type2) is not None
+                             and arg2_type.same_as(_value_class_of(type2))))
+                    if typed_arg2_ok or untyped_same_type_ok or value_class_ok:
                         call = SimpleCallNode(
                             self.pos,
                             function=AttributeNode(
@@ -15336,6 +15504,23 @@ class PrimaryCmpNode(ExprNode, CmpNode):
 
         if self.cascade:
             self.cascade = self.cascade.analyse_types(env)
+
+        # For cascaded comparisons involving value types (e.g. a <= b <= c):
+        # look up and cache the cpdef dunder entry on each comparison node now
+        # (while env is available); generate_operation_code will use it.
+        if self.cascade and (_value_class_of(type1) is not None or _value_class_of(type2) is not None):
+            dunder = _RICHCMP_TO_DUNDER.get(self.operator)
+            if dunder:
+                self._vc_cmp_entry = _lookup_cpdef_dunder(type1, dunder)
+            # Walk the cascade chain; left-operand type = operand2 of previous node.
+            cnode = self.cascade
+            left_type = type2
+            while cnode is not None:
+                cdunder = _RICHCMP_TO_DUNDER.get(cnode.operator)
+                if cdunder:
+                    cnode._vc_cmp_entry = _lookup_cpdef_dunder(left_type, cdunder)
+                left_type = cnode.operand2.type
+                cnode = getattr(cnode, 'cascade', None)
 
         if self.operator in ('in', 'not_in'):
             if self.is_c_string_contains():
@@ -16358,8 +16543,14 @@ class ProxyNode(CoercionNode):
     def may_be_none(self):
         return self.arg.may_be_none()
 
+    def result_in_temp(self):
+        return self.arg.result_in_temp()
+
     def generate_evaluation_code(self, code):
         self.arg.generate_evaluation_code(code)
+
+    def generate_post_assignment_code(self, code):
+        self.arg.generate_post_assignment_code(code)
 
     def generate_disposal_code(self, code):
         self.arg.generate_disposal_code(code)

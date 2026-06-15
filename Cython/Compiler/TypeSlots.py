@@ -16,9 +16,10 @@ invisible = ['__cinit__', '__dealloc__', '__richcmp__',
 richcmp_special_methods = ['__eq__', '__ne__', '__lt__', '__gt__', '__le__', '__ge__']
 
 # Dunder methods that can be promoted to cpdef/ccall inside cclasses.
-# Binop operators (+, -, *, //, /, %, @) plus inplace variants.
+# Binop operators (+, -, *, //, /, %, @) plus inplace variants and reflected variants.
 CPDEF_PROMOTABLE_BINOP_METHODS = frozenset([
     '__add__', '__sub__', '__mul__', '__truediv__', '__floordiv__', '__mod__', '__matmul__',
+    '__radd__', '__rsub__', '__rmul__', '__rtruediv__', '__rfloordiv__', '__rmod__', '__rmatmul__',
     '__iadd__', '__isub__', '__imul__', '__itruediv__', '__ifloordiv__', '__imod__', '__imatmul__',
 ])
 # Unary operators.

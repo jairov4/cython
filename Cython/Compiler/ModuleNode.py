@@ -1523,6 +1523,11 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             value_type.to_py_function, valstruct))
         code.putln("static %s %s(PyObject *); /*proto*/" % (
             valstruct, value_type.from_py_function))
+        if value_type.needs_refcounting:
+            code.putln("static CYTHON_INLINE void %s(%s *); /*proto*/" % (
+                value_type._refcount_incref_fname, valstruct))
+            code.putln("static CYTHON_INLINE void %s(%s *); /*proto*/" % (
+                value_type._refcount_decref_fname, valstruct))
 
     def generate_value_class_converters(self, env, code):
         # Generate converters for locally-defined value_type classes.
@@ -1552,15 +1557,24 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         typeptr = code.name_in_slot_module_state(ext_type.typeptr_cname)
         empty_tuple = code.name_in_slot_module_state(Naming.empty_tuple)
         member = Naming.value_member_cname
+        refcounted = value_type.needs_refcounting
 
         code.globalstate.use_utility_code(
             UtilityCode.load_cached("tp_new", "ObjectHandling.c"))
+
+        # Refcount helper functions (only for value classes with object fields).
+        if refcounted:
+            self._generate_value_class_refcount_helpers(value_type, code)
 
         # to_py: box a value struct into a fresh boxed object (new object each call).
         code.putln("static PyObject *%s(%s v) {" % (value_type.to_py_function, valstruct))
         code.putln("PyObject *o = __Pyx_tp_new((PyObject *)%s, %s);" % (typeptr, empty_tuple))
         code.putln("if (unlikely(!o)) return NULL;")
         code.putln("((struct %s *)o)->%s = v;" % (objstruct, member))
+        if refcounted:
+            # The boxed object takes ownership of its own refs: INCREF the fields.
+            code.putln("%s(&((struct %s *)o)->%s);" % (
+                value_type._refcount_incref_fname, objstruct, member))
         code.putln("return o;")
         code.putln("}")
 
@@ -1574,7 +1588,42 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         code.putln("memset(&r, 0, sizeof(r));")
         code.putln("return r;")
         code.putln("}")
-        code.putln("return ((struct %s *)o)->%s;" % (objstruct, member))
+        code.putln("r = ((struct %s *)o)->%s;" % (objstruct, member))
+        if refcounted:
+            # The extracted value owns its refs independently of the boxed object.
+            code.putln("%s(&r);" % value_type._refcount_incref_fname)
+        code.putln("return r;")
+        code.putln("}")
+
+    def _generate_value_class_refcount_helpers(self, value_type, code):
+        """Emit __Pyx_INCREF_<cname> and __Pyx_XDECREF_<cname> for a value class
+        that has refcounted fields (pyobject, memoryview, or nested value_type)."""
+        valstruct = value_type.empty_declaration_code()
+
+        # INCREF: increment each refcounted field.
+        code.putln("static CYTHON_INLINE void %s(%s *v) {" % (
+            value_type._refcount_incref_fname, valstruct))
+        for f in value_type.scope.var_entries:
+            ftype = f.type
+            if ftype.is_pyobject:
+                code.putln("Py_XINCREF(v->%s);" % f.cname)
+            elif getattr(ftype, 'is_value_class', False) and ftype.needs_refcounting:
+                code.putln("%s(&v->%s);" % (ftype._refcount_incref_fname, f.cname))
+            elif ftype.is_memoryviewslice:
+                code.putln("__PYX_INC_MEMVIEW(&v->%s, 1);" % f.cname)
+        code.putln("}")
+
+        # XDECREF: decrement each refcounted field (NULL-check inside Py_XDECREF).
+        code.putln("static CYTHON_INLINE void %s(%s *v) {" % (
+            value_type._refcount_decref_fname, valstruct))
+        for f in value_type.scope.var_entries:
+            ftype = f.type
+            if ftype.is_pyobject:
+                code.putln("Py_XDECREF(v->%s);" % f.cname)
+            elif getattr(ftype, 'is_value_class', False) and ftype.needs_refcounting:
+                code.putln("%s(&v->%s);" % (ftype._refcount_decref_fname, f.cname))
+            elif ftype.is_memoryviewslice:
+                code.putln("__PYX_XCLEAR_MEMVIEW(&v->%s, 1);" % f.cname)
         code.putln("}")
 
     def generate_objstruct_definition(self, type, code):
@@ -2030,12 +2079,18 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             dict_slot = None
 
         _, (py_attrs, _, memoryview_slices) = scope.get_refcounted_entries()
+        # Also collect nested refcounted value_type fields that need explicit cleanup.
+        refcounted_value_attrs = [
+            entry for entry in scope.var_entries
+            if getattr(entry.type, 'is_value_class', False) and entry.type.needs_refcounting
+        ]
         explicitly_destructable_attrs = [
             entry for entry in scope.var_entries
             if entry.type.needs_explicit_destruction(scope)
         ]
 
-        if py_attrs or explicitly_destructable_attrs or memoryview_slices or weakref_slot or dict_slot:
+        if (py_attrs or explicitly_destructable_attrs or memoryview_slices
+                or refcounted_value_attrs or weakref_slot or dict_slot):
             self.generate_self_cast(scope, code)
 
         if not is_final_type or scope.may_have_finalize():
@@ -2086,6 +2141,11 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         for entry in (py_attrs + memoryview_slices):
             code.put_xdecref_clear("p->%s" % entry.cname, entry.type, nanny=False,
                                    clear_before_decref=True, have_gil=True)
+
+        for entry in refcounted_value_attrs:
+            # Nested refcounted value_type field: call the value class's own decref helper.
+            code.put_xdecref_clear("p->%s" % entry.cname, entry.type, nanny=False,
+                                   have_gil=True)
 
         if base_type:
             base_cname = base_type.typeptr_cname

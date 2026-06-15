@@ -193,38 +193,19 @@ python runtests.py --no-code-style -x Debugger --backends=c,cpp -j32
 
 `/Users/jairo/repos/crop-chronicles` is a real (non-trivial) game project used to validate that
 Cython changes work beyond the unit test suite. The `embed_modules_optimize` work has broken it
-before while passing the test suite, so check it for regressions on the constructor/super
-optimization work.
+before while passing the test suite, so check it for regressions.
 
 - **Build pipeline:** Poetry + scons. The project's own pipeline transpiles pure-Python `.py` into
   `.pyx`, then runs Cython to compile them. **Focus on the Cython behavior only** — the transpile
   pipeline is correct.
 - **Generated `.pyx` to inspect:** `build/lib.macos-desktop-clang/cython/` (these are the inputs to
-  Cython; debug Cython codegen here, e.g. the generated `.c`).
+  Cython; debug Cython codegen here, e.g. the generated `.cpp`).
 - **Build output:** `build/lib.macos-desktop-clang/bundle/`.
 - **Canonical build command (fish):**
   `poetry run pip uninstall -y Cython ;and poetry lock ;and poetry install --sync ;and poetry run scons bundle mode=local_debug test_runner=1`
-- **⚠️ Do NOT run the poetry command from this Cython dev environment** — we are already in an
-  activated venv for Cython development, and running poetry as above would corrupt that venv. It is
-  listed only for reference / for the user to run.
 - **Run the embedded game test runner:**
   `./farm_rush.exe --test-runner test/manual/test_fps_benchmark.py` (from the `bundle/` dir).
-- **⚠️ The full build + test runner is slow and produces huge logs.** Always redirect stdout+stderr
-  to a file (e.g. `> /tmp/cc_build.log 2>&1`) and run it in the background; never re-run it without
-  an intervening code change.
-- **Not every crop-chronicles failure is a Cython bug.** The `test_fps_benchmark` runner had TWO
-  independent failures: (1) the cross-module `super().__init__()` regression above (a real Cython
-  bug — fixed in `Optimize.py`); and (2) an `OverflowError: value too large to convert to int` in
-  `tile_map_data.get_static_tile_desc`, which was a **source** bug: `tile_id: int` (= `cython.int`,
-  declared via `from cython import int`) is too narrow for raw Tiled GIDs, whose high bits encode
-  flip flags (value up to `0xFFFFFFFF`, from the pure-Python `pytiled_parser`). Fixed source-side by
-  widening the GID-receiving params to `cython.uint` (`get_static_tile_desc`, `get_tile_by_id`,
-  `get_tile_desc`, `is_tile_flipped_horizontally/_vertically` in
-  `farm_rush/engine/tilemap/tile_map_data.py` — edit the `.py`, the `.pyx` is generated). Lesson:
-  to tell whether a failure is a compiler regression, regenerate the failing `.cpp` with the Cython
-  at a known-good commit (e.g. one tagged "Green … compiling project too") via a `git worktree` and
-  diff the relevant codegen — if it's byte-identical, the cause is source/data, not Cython.
-- **`python_subclassing=False` is set globally** in `builder/native_codegen.py:DEFAULT_CYTHON_COMPILER_DIRECTIVES`. Known classes in crop-chronicles that still need fixing: `IObservableGroup` in `farm_rush/engine/i_game_node.py:91` (pure Python class inheriting from `IGroup` cclass — needs `@cclass`); `KeyFrameAnimationFloat` and `KeyFrameAnimationVector2` inherit from `AnimationValueBase` and override `_compute_value` — since `python_subclassing=False` suppresses dispatch, those overrides are never called via C; they too need `@cclass` or their base needs `@cython.python_subclassing(True)`.
+- **`python_subclassing=False` is set globally** in `builder/native_codegen.py:DEFAULT_CYTHON_COMPILER_DIRECTIVES`.
 - **Fast codegen check (no full build):** to verify Cython output for a single generated `.pyx`
   without the multi-minute scons build, run `Cython.Compiler.Main.compile` directly from a tiny
   driver: `chdir` into `build/lib.macos-desktop-clang/cython/`, set `Options.cimport_from_pyx=True`,
@@ -234,50 +215,9 @@ optimization work.
   (some `.pxd` like `sdl2_capi.pxd` live in the source tree, not the generated dir), and
   `--output-file /tmp/foo.cpp` so you don't clobber the build cache. Then grep the `.cpp` for the
   codegen of interest.
-- **Updating the dev Cython without a full reinstall:** crop-chronicles consumes Cython as the local
-  wheel `dist/cython-3.3.0a0-cp313-cp313-macosx_15_0_arm64.whl` (pinned by exact filename in
-  `pyproject.toml`). `Optimize.py` (and most `Compiler/*.py`) ship as **pure `.py`** inside that
-  wheel, so you can swap the fixed file into the existing wheel (preserving filename/tag/compiled
-  `.so`s) and regenerate the `.dist-info/RECORD` line for it, rather than rebuilding the wheel.
-  Run the build with `env -u VIRTUAL_ENV -u PYTHONPATH poetry …` so Poetry uses its own managed venv
-  (`~/Library/Caches/pypoetry/virtualenvs/farm-rush-*`) instead of the active Cython dev venv —
-  otherwise `poetry install --sync` corrupts the Cython dev venv.
-- **⚠️ There are multiple Poetry venvs for farm-rush — always identify the active one first.**
-  `ls ~/Library/Caches/pypoetry/virtualenvs/ | grep farm` lists them all (there may be 5+). The
-  active one for the current lock file is given by `cd /Users/jairo/repos/crop-chronicles && poetry
-  env info --path`. Copy compiler files into THAT venv's `lib/python3.13/site-packages/Cython/Compiler/`
-  and delete `__pycache__/*.pyc` for the changed files — stale bytecode will shadow your edits.
-- **⚠️ THREE caches will silently serve stale output when the Cython *version* is unchanged
-  (`3.3.0a0`); all bit me hard:**
-  1. **Poetry/pip won't reinstall** a same-version path wheel even after `pip uninstall` + `poetry
-     lock` + `poetry install` — the venv keeps the OLD `Optimize.py`. **Verify** with
-     `grep <your-change> <poetry-venv>/lib/python3.13/site-packages/Cython/Compiler/Optimize.py`.
-     The reliable fix is to copy your edited `Optimize.py` **directly** into that site-packages dir
-     (then run scons only — do NOT re-run `poetry install`, which would overwrite it with the stale
-     wheel). Also `rm -rf <venv>/.../Cython/Compiler/__pycache__` — stale `.pyc` can shadow edits.
-  2. **The Cython compile cache** at `/Users/jairo/Library/Caches/cython` (`--cache` is passed by the
-     pipeline) is keyed on source+directives+Cython *version*, not the compiler's file contents, so
-     it returns `.cpp` generated by the previous compiler. `rm -rf /Users/jairo/Library/Caches/cython`
-     before rebuilding. Also delete the already-generated `.cpp`/`.o` under
-     `build/lib.macos-desktop-clang/cython/` (keep `.pyx`/`.pxd`) to force scons to regenerate.
-  3. **The scons CacheDir** at `~/.cache/farm-rush/scons` (override via env `SCONS_CACHE`;
+- **The scons CacheDir** at `~/.cache/farm-rush/scons` (override via env `SCONS_CACHE`;
      configured in `builder/scons_env.py`), content-keyed on sources+command — NOT the compiler
-     internals. Even after (1) and (2), scons restores the previous compiler's `.cpp`/`.o` from
+     internals. scons restores the previous compiler's `.cpp`/`.o` from
      this cache ("Retrieved `…' from cache" lines in the build log are the tell). Purge
      `rm -rf ~/.cache/farm-rush/scons` whenever the Cython compiler itself changed.
-- **Validating trampolines in crop-chronicles codegen:** after a successful build, check
-  `build/lib.macos-desktop-clang/cython/farm_rush/engine/nodes/game_node2d.cpp` (or any other
-  generated `.cpp`). Two things to grep:
-  1. `grep -oE "__pyx_f_[a-zA-Z0-9_]*hit_test_point[a-zA-Z0-9_]*" game_node2d.cpp | sort -u` —
-     must show `__pyx_f_..._GameNode2D_hit_test_point` (the C trampoline body). If only `__pyx_pf_`
-     and `__pyx_pw_` appear, the trampoline did not fire.
-  2. `grep "hit_test_point" game_node2d.cpp | grep vtable` — must show
-     `__pyx_vtable_...GameNode2D.__pyx_base.hit_test_point = (cast)__pyx_f_..._GameNode2D_hit_test_point`.
-     The `.__pyx_base.hit_test_point` confirms the inherited vtable slot (not a new one) is filled.
-- **crop-chronicles source change (trampoline-related):** `@no_ccall` was removed from
-  `hit_test_point` in `farm_rush/engine/nodes/game_node.py` (the base, which has a cpdef-compatible
-  body `raise NotImplementedError()`). The override in `game_node2d.py` is a generator (`yield self`)
-  and gets a C trampoline automatically. This lets all `b.hit_test_point(pointer)` calls where
-  `b: IGameNode2D` use vtable dispatch instead of Python. The corresponding generated `.pyx` at
-  `build/lib.macos-desktop-clang/cython/farm_rush/engine/nodes/game_node.pyx` was also updated
-  to remove `@no_ccall` (scons will regenerate it from source on the next full build anyway).
+- **All in one script**: Just run `./test-in-crop-chronicles.fish`

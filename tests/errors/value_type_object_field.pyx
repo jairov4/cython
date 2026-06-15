@@ -1,14 +1,12 @@
-# mode: error
+# mode: compile
+# Object/str/list fields in value_type classes are now allowed (v3).
+# This file verifies that a value_type class with an object field compiles successfully.
 cimport cython
 from dataclasses import dataclass
 
 @cython.value_type
 @cython.final
 @dataclass(frozen=True)
-cdef class Vec:
-    x: object
-
-
-_ERRORS = """
-9:4: value_type field 'x' must be a C type (int/float/bool/enum/ctuple/nested value type), not a Python object
-"""
+cdef class Tagged:
+    n: cython.double
+    label: object
