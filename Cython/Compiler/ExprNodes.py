@@ -931,7 +931,7 @@ class ExprNode(Node):
             elif self.type.is_memoryviewslice:
                 code.putln("%s.memview = NULL;" % self.result())
                 code.putln("%s.data = NULL;" % self.result())
-            elif getattr(self.type, 'is_value_class', False) and self.type.needs_refcounting:
+            elif self.type.is_value_class and self.type.needs_refcounting:
                 # Clear all fields to NULL so the subsequent disposal is a no-op
                 # (mirrors 'cname = 0' for pyobject after a value has been moved out).
                 code.putln("memset(&%s, 0, sizeof(%s));" % (
@@ -1210,7 +1210,7 @@ class ExprNode(Node):
         elif type.is_ctuple:
             bool_value = len(type.components) == 0
             return BoolNode(self.pos, value=bool_value)
-        elif getattr(type, 'is_value_class', False):
+        elif type.is_value_class:
             if type.scope and type.scope.lookup("__bool__"):
                 return SimpleCallNode(
                     self.pos,
@@ -2236,7 +2236,7 @@ class NameNode(AtomicExprNode):
                     return node
                 # Unbound cpdef classmethod: rebuild as Python attribute access so
                 # that keyword arguments and defaults are handled via the descriptor.
-                if (getattr(entry, 'is_unbound_cmethod', False) and
+                if (entry.is_unbound_cmethod and
                         getattr(entry.type, 'is_classmethod', False) and
                         getattr(entry, 'classmethod_obj', None) is not None):
                     obj = entry.classmethod_obj.analyse_types(env)
@@ -2263,8 +2263,29 @@ class NameNode(AtomicExprNode):
         annotation = self.annotation
         entry = self.entry or env.lookup_here(name)
         if not entry:
-            # annotations never create global cdef names
+            # Annotations normally never create global cdef names.
+            # Exception: Final[C-type] at module level becomes a typed C constant so
+            # that arithmetic using these constants can be inferred as C operations.
+            # We detect Final[T] manually via known_standard_library_import (rather
+            # than registering Final as a global SpecialPythonTypeConstructor, which
+            # would break Final[PythonClass] annotations on function parameters).
             if env.is_module_scope:
+                if (annotation and not annotation.expr.is_string_literal
+                        and env.directives.get('annotation_typing', True)):
+                    _expr = annotation.expr
+                    if (_expr.is_subscript and _expr.base.is_name):
+                        _base_entry = env.lookup(_expr.base.name)
+                        if (_base_entry is not None
+                                and _base_entry.known_standard_library_import
+                                in ('typing.Final', 'typing_extensions.Final')):
+                            _atype = _expr.index.analyse_as_type(env)
+                            if _atype is not None and not _atype.is_pyobject and not _atype.is_error:
+                                entry = self.entry = env.declare_var(
+                                    name, _atype, self.pos, is_cdef=True, visibility='private')
+                                entry.exported_to_pydict = True
+                                if not entry.annotation:
+                                    entry.annotation = annotation
+                                return
                 return
 
             modifiers = ()
@@ -2787,7 +2808,7 @@ class NameNode(AtomicExprNode):
             if self.type.is_const:
                 # Const variables are assigned when declared
                 assigned = True
-            if (getattr(self.type, 'is_value_class', False)
+            if (self.type.is_value_class
                     and self.type.needs_refcounting
                     and self.use_managed_ref):
                 # Refcounted value class: mirror the pyobject owned-reference path.
@@ -2856,6 +2877,24 @@ class NameNode(AtomicExprNode):
                 rhs.generate_post_assignment_code(code)
 
             rhs.free_temps(code)
+
+            if (entry.is_cglobal and not entry.type.is_pyobject
+                    and entry.scope and entry.scope.is_module_scope
+                    and getattr(entry, 'exported_to_pydict', False)):
+                # Final[C-type] module constants must also appear in the Python
+                # module dict so that "from module import name" keeps working.
+                to_py_fn = entry.type.to_py_function
+                if to_py_fn:
+                    tmp = code.funcstate.allocate_temp(py_object_type, manage_ref=True)
+                    interned_cname = code.intern_identifier(entry.name)
+                    moddict = code.name_in_module_state(Naming.moddict_cname)
+                    code.putln("%s = %s(%s);" % (tmp, to_py_fn, self.result()))
+                    code.putln(code.error_goto_if_null(tmp, self.pos))
+                    code.put_gotref(tmp, py_object_type)
+                    code.put_error_if_neg(self.pos,
+                        "PyDict_SetItem(%s, %s, %s)" % (moddict, interned_cname, tmp))
+                    code.put_decref_clear(tmp, py_object_type)
+                    code.funcstate.release_temp(tmp)
 
     def generate_acquire_memoryviewslice(self, rhs, code):
         """
@@ -2927,8 +2966,7 @@ class NameNode(AtomicExprNode):
             else:
                 code.put_error_if_neg(self.pos, del_code)
         elif (self.entry.type.is_pyobject or self.entry.type.is_memoryviewslice
-              or (getattr(self.entry.type, 'is_value_class', False)
-                  and self.entry.type.needs_refcounting)):
+              or (self.entry.type.is_value_class and self.entry.type.needs_refcounting)):
             if not self.cf_is_null:
                 if self.cf_maybe_null and not ignore_nonexisting:
                     code.put_error_if_unbound(self.pos, self.entry, self.in_nogil_context)
@@ -6305,7 +6343,7 @@ class CallNode(ExprNode):
                     # value_type ctor: Vec2(...) in a type-inference context has
                     # the value struct as its inferred type, not the boxed object.
                     eq = getattr(result_type, 'equivalent_type', None)
-                    if eq is not None and getattr(eq, 'is_value_class', False):
+                    if eq is not None and eq.is_value_class:
                         return eq
                     return result_type
                 elif result_type.is_builtin_type:
@@ -6384,7 +6422,7 @@ class CallNode(ExprNode):
         Returns a replacement node or None
         """
         type = self.function.analyse_as_type(env)
-        if type and getattr(type, 'is_value_class', False):
+        if type and type.is_value_class:
             # Stage 3: lower value_type construction Vec2(1, 2) to a direct,
             # stack-allocated struct initialisation (zero heap allocation, no
             # tp_new / tp_init).  Because value_type classes are frozen
@@ -6731,7 +6769,7 @@ class SimpleCallNode(CallNode):
         # value_type method self coercion: turn the actual self expression into a
         # pointer to the value struct (formal_ptr_type = __pyx_val_T *).
         actual = actual.analyse_types(env)
-        if getattr(actual.type, 'is_value_class', False):
+        if actual.type.is_value_class:
             # Actual is a value struct (by value).  Take its address.  A CloneNode
             # wrapper is not addressable, so unwrap to the underlying lvalue; if
             # that still isn't addressable, materialise to a temp.
@@ -6781,7 +6819,7 @@ class SimpleCallNode(CallNode):
         # auto-inject the defining class as 'cls'.
         ubcm_function_entry = getattr(self.function, 'entry', None)
         if (ubcm_function_entry and
-                getattr(ubcm_function_entry, 'is_unbound_cmethod', False) and
+                ubcm_function_entry.is_unbound_cmethod and
                 getattr(func_type, 'is_classmethod', False) and
                 func_type.args):
             nargs_without_cls = len(func_type.args) - 1
@@ -7841,7 +7879,7 @@ class GeneralCallNode(CallNode):
                         (self.function.entry.is_cmethod and
                          (self.function.entry.is_overridable or
                           getattr(self.function.type, 'is_overridable', False))) or
-                        (getattr(self.function.entry, 'is_unbound_cmethod', False) and
+                        (self.function.entry.is_unbound_cmethod and
                          getattr(self.function.type, 'is_classmethod', False))):
                     # Fall back to Python dispatch. AttributeNode.coerce_to handles both
                     # directly-defined cpdef (is_cfunction+as_variable) and inherited cpdef
@@ -7892,7 +7930,7 @@ class GeneralCallNode(CallNode):
         kwargs = self.keyword_args
         declared_args = function_type.args
         _is_unbound_classmethod = (
-            getattr(entry, 'is_unbound_cmethod', False) and
+            entry.is_unbound_cmethod and
             getattr(function_type, 'is_classmethod', False))
         if entry.is_cmethod or _is_unbound_classmethod:
             declared_args = declared_args[1:]  # skip 'self' / 'cls'
@@ -8449,7 +8487,7 @@ class AttributeNode(ExprNode):
         if self.obj.is_string_literal:
             return
         type = self.obj.analyse_as_type(env)
-        if type and getattr(type, 'is_value_class', False) and type.boxed_type is not None:
+        if type and type.is_value_class and type.boxed_type is not None:
             # value_type: methods live on the boxed extension type's scope, so an
             # unbound C method reference (e.g. Vec2.__init__) must resolve there.
             type = type.boxed_type
@@ -8575,7 +8613,7 @@ class AttributeNode(ExprNode):
         obj_type = self.obj.type
         if obj_type is None:
             return False
-        if getattr(obj_type, 'is_value_class', False):
+        if obj_type.is_value_class:
             boxed = obj_type.boxed_type
             scope = boxed.scope if boxed is not None else None
         elif obj_type.is_extension_type:
@@ -8686,7 +8724,7 @@ class AttributeNode(ExprNode):
                 # type's scope, not the value struct's scope (which only carries
                 # data fields).  When the attribute is not a data field, fall back
                 # to the boxed scope so v.method() resolves to the cmethod entry.
-                if (entry is None and getattr(obj_type, 'is_value_class', False)
+                if (entry is None and obj_type.is_value_class
                         and obj_type.boxed_type is not None
                         and obj_type.boxed_type.scope is not None):
                     boxed_entry = obj_type.boxed_type.scope.lookup_here(self.attribute)
@@ -8847,7 +8885,7 @@ class AttributeNode(ExprNode):
             # value_type (Stage 4): a method bound on a value struct (or on the
             # boxed type via the value-class fallback) is always final by
             # construction -> direct call through final_func_cname.
-            if (getattr(obj.type, 'is_value_class', False)
+            if (obj.type.is_value_class
                     or (obj.type.is_ptr and getattr(obj.type.base_type, 'is_value_class', False))):
                 if self.entry.final_func_cname:
                     return self.entry.final_func_cname
@@ -10615,11 +10653,11 @@ class DictNode(ExprNode):
                 # For refcounted value class fields, the struct takes ownership:
                 # INCREF the object fields so that subsequent disposal of the arg
                 # temp doesn't steal the struct's reference.
-                if getattr(self.type, 'is_value_class', False) and self.type.needs_refcounting:
+                if self.type.is_value_class and self.type.needs_refcounting:
                     mtype = member.type
                     if mtype.is_pyobject:
                         code.putln("Py_XINCREF(%s.%s);" % (self.result(), key_cname))
-                    elif getattr(mtype, 'is_value_class', False) and mtype.needs_refcounting:
+                    elif mtype.is_value_class and mtype.needs_refcounting:
                         code.putln("%s(&%s.%s);" % (
                             mtype._refcount_incref_fname, self.result(), key_cname))
                     elif mtype.is_memoryviewslice:
@@ -13223,7 +13261,7 @@ def _safe_infer_type(node, env):
             if func_entry is not None and func_entry.type is not None \
                     and func_entry.type.is_extension_type:
                 eq = getattr(func_entry.type, 'equivalent_type', None)
-                if eq is not None and getattr(eq, 'is_value_class', False):
+                if eq is not None and eq.is_value_class:
                     return eq
                 return func_entry.type
     return py_object_type
@@ -13234,7 +13272,7 @@ def _value_class_of(t):
     # (e.g. `self` inside a value_type method has type `__pyx_val_T *`), else None.
     if t is None:
         return None
-    if getattr(t, 'is_value_class', False):
+    if t.is_value_class:
         return t
     if t.is_ptr and getattr(t.base_type, 'is_value_class', False):
         return t.base_type
@@ -15487,7 +15525,7 @@ class PrimaryCmpNode(ExprNode, CmpNode):
                     # value class (or a pointer to it, i.e. 'self' in a value method).
                     value_class_ok = (
                         arg2_type is not None
-                        and getattr(arg2_type, 'is_value_class', False)
+                        and arg2_type.is_value_class
                         and (_value_class_of(type2) is not None
                              and arg2_type.same_as(_value_class_of(type2))))
                     if typed_arg2_ok or untyped_same_type_ok or value_class_ok:
@@ -15520,7 +15558,7 @@ class PrimaryCmpNode(ExprNode, CmpNode):
                 if cdunder:
                     cnode._vc_cmp_entry = _lookup_cpdef_dunder(left_type, cdunder)
                 left_type = cnode.operand2.type
-                cnode = getattr(cnode, 'cascade', None)
+                cnode = cnode.cascade
 
         if self.operator in ('in', 'not_in'):
             if self.is_c_string_contains():
@@ -16610,7 +16648,7 @@ class CloneNode(CoercionNode):
         # A value-class struct result lives in a plain C temp variable, so its
         # address can be taken (needed for the value-ABI self pointer when a
         # value_type ctor-expression is used directly as a binop/method operand).
-        if getattr(self.type, 'is_value_class', False):
+        if self.type.is_value_class:
             return True
         return self.arg.is_addressable()
 
@@ -16699,7 +16737,7 @@ class ClassmethodSelfNode(ExprNode):
         # Value class instances are C structs — Py_TYPE() cannot be applied.
         # Use the statically known type pointer (always in module state) instead.
         self_type = self.self_arg.type
-        if getattr(self_type, 'is_value_class', False):
+        if self_type.is_value_class:
             from . import Naming
             boxed = self_type.boxed_type
             return "((PyObject *)%s->%s)" % (Naming.modulestateglobal_cname, boxed.typeptr_cname)
