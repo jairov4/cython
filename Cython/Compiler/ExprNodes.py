@@ -10653,12 +10653,13 @@ class DictNode(ExprNode):
                 member = struct_scope.lookup_here(item.key.value)
                 assert member is not None, f"struct member {item.key.value} not found, error was not handled during coercion"
                 key_cname = member.cname
-                value_cname = item.value.result()
                 if item.value.type.is_array:
+                    value_cname = item.value.result()
                     code.globalstate.use_utility_code(UtilityCode.load_cached("IncludeStringH", "StringTools.c"))
                     code.putln(f"memcpy({self.result()}.{key_cname}, {value_cname}, sizeof({value_cname}));")
                 else:
-                    code.putln(f"{self.result()}.{key_cname} = {value_cname};")
+                    value_code = item.value.result_as(member.type)
+                    code.putln(f"{self.result()}.{key_cname} = {value_code};")
                 # For refcounted value class fields, the struct takes ownership:
                 # INCREF the object fields so that subsequent disposal of the arg
                 # temp doesn't steal the struct's reference.

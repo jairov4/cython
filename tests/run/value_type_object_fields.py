@@ -11,6 +11,26 @@ GC, and deletion.
 import cython
 import sys
 from dataclasses import dataclass
+from typing import Optional
+
+
+@cython.cclass
+class Wrapper:
+    """A plain extension type used as a cclass-typed field in a value type."""
+    value: cython.int
+
+    def __init__(self, value: cython.int) -> None:
+        self.value = value
+
+
+@cython.value_type
+@cython.final
+@cython.cclass
+@dataclass(frozen=True)
+class WithCclass:
+    """Value type whose field is a specific cclass (not plain object)."""
+    n: cython.double
+    obj: Optional[Wrapper]
 
 
 @cython.value_type
@@ -273,6 +293,35 @@ def test_list_field_gc():
     # This test just ensures no crash/hang.
 
 
+def test_cclass_typed_field_none():
+    """
+    Construction of a value type with a cclass-typed optional field set to None.
+    The generated struct member assignment must cast Py_None to the field's C type.
+    Regression: 'incompatible pointer types assigning PyObject* to ExtType*'.
+    """
+    v: WithCclass = WithCclass(1.0, None)
+    assert v.n == 1.0
+    assert v.obj is None
+
+    w = Wrapper(42)
+    v2: WithCclass = WithCclass(2.0, w)
+    assert v2.obj is w
+
+
+def test_cclass_typed_field_refcount():
+    """Cclass-typed field in a value type is refcounted correctly."""
+    if not cython.compiled:
+        return
+    w = Wrapper(7)
+    base = _rc(w)
+
+    v: WithCclass = WithCclass(1.0, w)
+    assert _rc(w) == base + 1
+
+    del v
+    assert _rc(w) == base
+
+
 @cython.cclass
 class Container:
     """Extension type that embeds a value type with a PyObject field as an attribute."""
@@ -355,6 +404,8 @@ def _doctest():
     >>> test_repeated_construction_no_leak()
     >>> test_list_field_refcount()
     >>> test_list_field_gc()
+    >>> test_cclass_typed_field_none()
+    >>> test_cclass_typed_field_refcount()
     >>> test_attribute_assignment_refcount()
     >>> test_embedded_value_type_gc()
     >>> test_dataclass_fields_visible()
