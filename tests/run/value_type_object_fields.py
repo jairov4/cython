@@ -273,6 +273,54 @@ def test_list_field_gc():
     # This test just ensures no crash/hang.
 
 
+@cython.cclass
+class Container:
+    """Extension type that embeds a value type with a PyObject field as an attribute."""
+    slot: Tagged
+
+    def __init__(self, v: Tagged) -> None:
+        self.slot = v
+
+    def replace_slot(self, v: Tagged) -> None:
+        self.slot = v
+
+
+def test_attribute_assignment_refcount():
+    """Assigning a refcounted value type to a cclass attribute INCs/DECREFs correctly."""
+    if not cython.compiled:
+        return
+    obj1 = object()
+    obj2 = object()
+    base1 = _rc(obj1)
+    base2 = _rc(obj2)
+
+    c = Container(Tagged(1.0, "a", obj1))
+    assert _rc(obj1) == base1 + 1, "container should hold ref to obj1"
+
+    c.replace_slot(Tagged(2.0, "b", obj2))
+    assert _rc(obj1) == base1, "old slot payload should be released"
+    assert _rc(obj2) == base2 + 1, "new slot payload should be acquired"
+
+    del c
+    assert _rc(obj2) == base2, "slot payload released when container deleted"
+
+
+def test_embedded_value_type_gc():
+    """
+    A cclass with an embedded refcounted value type participates in GC correctly.
+    Creates a cycle: Container.slot.payload -> lst -> Container.
+    tp_traverse must visit the PyObject fields inside the embedded value struct.
+    """
+    import gc
+    lst = []
+    c = Container(Tagged(1.0, "x", lst))
+    lst.append(c)  # cycle: c.slot.payload is lst, lst[0] is c
+    del c
+    del lst
+    gc.collect()
+    # If tp_traverse is missing, the cyclic garbage won't be collected.
+
+
 def test_dataclass_fields_visible():
     """dataclasses.fields() works on the boxed type."""
     import dataclasses
@@ -307,6 +355,8 @@ def _doctest():
     >>> test_repeated_construction_no_leak()
     >>> test_list_field_refcount()
     >>> test_list_field_gc()
+    >>> test_attribute_assignment_refcount()
+    >>> test_embedded_value_type_gc()
     >>> test_dataclass_fields_visible()
     >>> test_isinstance()
     """

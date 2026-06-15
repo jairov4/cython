@@ -59,6 +59,7 @@ Then you can check the generated file in: `TEST_TMP/build/embed_modules_optimize
 ## Development quirks & conventions
 
 - **No reinstall needed:** `runtests.py` uses the local source tree directly (`sys.path.insert(0, ...)`)
+- Do not abuse of `getattr` / `hasattr`. Always design for determinism, readability and long term solutions and NOT surgical changes.
 - **Cython is self-compiling:** It's a Python-to-C compiler written partly in Cython. `setup.py build_ext` compiles the hot modules (scanner, parser, codegen) to C for speed. Run this before `--coverage` runs.
 - **`# tag: embed`** tests are excluded under Limited API and Py_DEBUG (builds with `Py_DEBUG` defined)
 - **Properties on `@cclass`** generate `getset_descriptor` objects (not Python `property`). Use `descr.__set__(obj, val)` not `descr.fset(obj, val)` — `fset`/`fget`/`fdel` don't exist on `getset_descriptor`.

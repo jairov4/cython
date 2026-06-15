@@ -9014,6 +9014,14 @@ class AttributeNode(ExprNode):
                 from . import MemoryView
                 MemoryView.put_assign_to_memviewslice(
                         select_code, rhs, rhs.result(), self.type, code)
+            elif self.type.is_value_class and self.type.needs_refcounting and self.use_managed_ref:
+                rhs.make_owned_reference(code)
+                code.put_xdecref_set(select_code, self.ctype(), rhs.result_as(self.ctype()))
+                rhs.generate_post_assignment_code(code)
+                rhs.free_temps(code)
+                self.obj.generate_disposal_code(code)
+                self.obj.free_temps(code)
+                return
 
             if not self.type.is_memoryviewslice:
                 code.putln(
@@ -9710,7 +9718,8 @@ class TupleNode(SequenceNode):
                     arg.starred_expr_allowed_here = True
                 self.args[i] = arg.analyse_types(env)
         if (not self.mult_factor and
-                not any((arg.is_starred or arg.type.is_pyobject or arg.type.is_memoryviewslice or arg.type.is_fused)
+                not any((arg.is_starred or arg.type.is_pyobject or arg.type.is_memoryviewslice or arg.type.is_fused
+                         or arg.type.needs_refcounting)
                         for arg in self.args)):
             self.type = env.declare_tuple_type(self.pos, (arg.type for arg in self.args)).type
             self.is_temp = 1

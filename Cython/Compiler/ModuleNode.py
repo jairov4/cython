@@ -2278,13 +2278,18 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         have_entries, (py_attrs, py_buffers, memoryview_slices) = (
             scope.get_refcounted_entries(include_gc_simple=False))
 
+        refcounted_value_attrs = [
+            entry for entry in scope.var_entries
+            if entry.type.is_value_class and entry.type.needs_refcounting
+        ]
+
         needs_type_traverse = not base_type
         # we don't know statically if we need to traverse the type
         maybe_needs_type_traverse = False
 
         code.putln("int e;")
 
-        if py_attrs or py_buffers:
+        if py_attrs or py_buffers or refcounted_value_attrs:
             self.generate_self_cast(scope, code)
 
         if base_type:
@@ -2349,9 +2354,24 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             code.putln("e = (*v)(p->%s, a); if (e) return e;" % cname)
             code.putln("}")
 
+        for entry in refcounted_value_attrs:
+            self._generate_value_class_traverse_fields("p->%s" % entry.cname, entry.type, code)
+
         code.putln("return 0;")
         code.putln("}")
         code.exit_cfunc_scope()
+
+    def _generate_value_class_traverse_fields(self, prefix, vtype, code):
+        for field in vtype.scope.var_entries:
+            if field.type.is_pyobject:
+                var_code = "%s.%s" % (prefix, field.cname)
+                var_as_pyobject = PyrexTypes.typecast(PyrexTypes.py_object_type, field.type, var_code)
+                code.putln("if (%s) {" % var_code)
+                code.putln("e = (*v)(%s, a); if (e) return e;" % var_as_pyobject)
+                code.putln("}")
+            elif field.type.is_value_class and field.type.needs_refcounting:
+                self._generate_value_class_traverse_fields(
+                    "%s.%s" % (prefix, field.cname), field.type, code)
 
     def generate_clear_function(self, scope, code, cclass_entry):
         tp_slot = TypeSlots.get_slot_by_name("tp_clear", scope.directives)
@@ -2363,7 +2383,12 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         have_entries, (py_attrs, py_buffers, memoryview_slices) = (
             scope.get_refcounted_entries(include_gc_simple=False))
 
-        if py_attrs or py_buffers or base_type:
+        refcounted_value_attrs = [
+            entry for entry in scope.var_entries
+            if entry.type.is_value_class and entry.type.needs_refcounting
+        ]
+
+        if py_attrs or py_buffers or base_type or refcounted_value_attrs:
             unused = ''
         else:
             unused = 'CYTHON_UNUSED '
@@ -2373,7 +2398,7 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         if py_attrs and Options.clear_to_none:
             code.putln("PyObject* tmp;")
 
-        if py_attrs or py_buffers:
+        if py_attrs or py_buffers or refcounted_value_attrs:
             self.generate_self_cast(scope, code)
 
         if base_type:
@@ -2424,12 +2449,23 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             # Note: shouldn't this call PyBuffer_Release ??
             code.putln("Py_CLEAR(p->%s.obj);" % entry.cname)
 
+        for entry in refcounted_value_attrs:
+            self._generate_value_class_clear_fields("p->%s" % entry.cname, entry.type, code)
+
         if cclass_entry.cname == '__pyx_memoryviewslice':
             code.putln("__PYX_XCLEAR_MEMVIEW(&p->from_slice, 1);")
 
         code.putln("return 0;")
         code.putln("}")
         code.exit_cfunc_scope()
+
+    def _generate_value_class_clear_fields(self, prefix, vtype, code):
+        for field in vtype.scope.var_entries:
+            if field.type.is_pyobject:
+                code.putln("Py_CLEAR(%s.%s);" % (prefix, field.cname))
+            elif field.type.is_value_class and field.type.needs_refcounting:
+                self._generate_value_class_clear_fields(
+                    "%s.%s" % (prefix, field.cname), field.type, code)
 
     def generate_getitem_function(self, scope, code):
         # Implement 'sq_item()' and/or 'mp_subscript()', whichever is more suitable.
