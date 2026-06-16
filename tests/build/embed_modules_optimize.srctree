@@ -114,6 +114,18 @@ elif mode == 'auto_cpdef':
         "Expected vtable dispatch for len(t) via promoted cpdef __len__")
     assert "PyObject_Length(((PyObject *)__pyx_v_t))" not in a_c_content, (
         "Expected no PyObject_Length C-API call for len(t)")
+    # Nullable value type (Vec2 | None) of a cimported value_type is compiled to the
+    # specialized stack struct (NOT a boxed PyObject*) in the consumer module a.
+    assert "struct __pyx_optval___pyx_val_1b_Vec2" in a_c_content, (
+        "Expected the nullable value-type struct __pyx_optval___pyx_val_1b_Vec2 in a.c")
+    assert "__pyx_convert__from_py___pyx_optval___pyx_val_1b_Vec2" in a_c_content, (
+        "Expected the consumer to regenerate the nullable from_py converter")
+    # `ov2 if ov2 is not None else Vec2(7, 8)` builds the Vec2 value struct on the
+    # stack (no heap alloc / no Python type() call for the value-type construction).
+    assert "__pyx_optval___pyx_val_1b_Vec2 __pyx_v_ov" in a_c_content, (
+        "Expected local nullable Vec2 to use the stack struct, not a PyObject*")
+    assert "__pyx_optval___pyx_val_1b_Vec2 __pyx_v_ov2;" in a_c_content, (
+        "Expected local nullable Vec2 ov2 to use the stack struct, not a PyObject*")
     print("OK: auto_cpdef mode")
 
 elif mode == 'lto':
@@ -162,6 +174,8 @@ elif mode == 'lto':
         "Expected vtable dispatch for len(t) via promoted cpdef __len__")
     assert "PyObject_Length(((PyObject *)__pyx_v_t))" not in a_c_content, (
         "Expected no PyObject_Length C-API call for len(t)")
+    assert "__pyx_optval___pyx_val_1b_Vec2 __pyx_v_ov2;" in a_c_content, (
+        "Expected local nullable Vec2 ov2 to use the stack struct, not a PyObject*")
     print("OK: LTO mode")
 
 elif mode == 'lto_no_python_subclassing':
@@ -199,6 +213,8 @@ elif mode == 'lto_no_python_subclassing':
         "Expected vtable dispatch for len(t) via promoted cpdef __len__")
     assert "PyObject_Length(((PyObject *)__pyx_v_t))" not in a_c_content, (
         "Expected no PyObject_Length C-API call for len(t)")
+    assert "__pyx_optval___pyx_val_1b_Vec2 __pyx_v_ov2;" in a_c_content, (
+        "Expected local nullable Vec2 ov2 to use the stack struct, not a PyObject*")
     print("OK: LTO + python_subclassing=False mode")
 
 else:
@@ -398,12 +414,18 @@ assert u.class_tag() == 'B'
 assert a.func_in_a() == 9
 assert b.func_in_b() == 9
 
+# Test nullable value types across the embed boundary
+assert b.opt_vec_sum(b.Vec2(1, 2)) == 3
+assert b.opt_vec_sum(None) == -1
+assert b.make_opt_vec(True).x == 3
+assert b.make_opt_vec(False) is None
+
 print("DONE")
 
 ################# a.pyx ####################
 
-from b import B, Derived, Derived2, Derived3, IBase, BWithOptInit, func_in_b, func_with_parameter, Color, DataClass, DataClass2
-from b cimport B, Derived, Derived2, Derived3, IBase, BWithOptInit, func_in_b, func_with_parameter, Color, DataClass, DataClass2
+from b import B, Derived, Derived2, Derived3, IBase, BWithOptInit, func_in_b, func_with_parameter, Color, DataClass, DataClass2, Vec2, opt_vec_sum, make_opt_vec, make_opt_vec_typed
+from b cimport B, Derived, Derived2, Derived3, IBase, BWithOptInit, func_in_b, func_with_parameter, Color, DataClass, DataClass2, Vec2, opt_vec_sum, make_opt_vec, make_opt_vec_typed
 from cython import ccall, cclass, int, bint as bool, typeof
 
 cdef bint _helper = True
@@ -565,6 +587,36 @@ def func_in_a():
     tp = (5, 2.5)
     assert tp[0] == 5 and tp[1] == 2.5
 
+    # --- Nullable value types (Vec2 | None) exercised cross-module ---
+    # Local nullable, narrowed via `is not None` -> unguarded direct field access.
+    ov: Vec2 | None = Vec2(3, 4)
+    assert ov is not None
+    assert ov.x == 3 and ov.y == 4
+    # Local nullable holding None.
+    ov2: Vec2 | None = None
+    assert ov2 is None
+    # nullable -> value unwrap via conditional default (no None case here).
+    got: Vec2 = ov2 if ov2 is not None else Vec2(7, 8)
+    assert got.x == 7 and got.y == 8
+    # Cross-module ccall taking a nullable value type by value.
+    assert opt_vec_sum(Vec2(1, 2)) == 3
+    assert opt_vec_sum(None) == -1
+    assert opt_vec_sum(ov) == 7
+    # Boxing a nullable across to Python (None or a real instance).
+    boxed: object = ov
+    assert boxed is not None and boxed.x == 3
+    boxed_none: object = ov2
+    assert boxed_none is None
+    # Cross-module function returning a boxed Optional[Vec2].
+    assert make_opt_vec(False) is None
+    assert make_opt_vec(True).y == 4
+    # Cross-module value-type method on a narrowed nullable.
+    assert ov.add(Vec2(10, 20)).x == 13
+    ov2 = make_opt_vec_typed(False)
+    assert ov2 is None
+    ov2 = make_opt_vec_typed(True)
+    assert ov2 is not None and ov2.y == 4
+
     return func_in_b()
 
 @ccall
@@ -702,12 +754,42 @@ class DerivedWithCtorOverrideClosure(DerivedWithCtor):
 ################# b.pyx ####################
 
 from enum import Enum
-from cython import cclass, ccall, final, int, float, freelist
+from cython import cclass, ccall, final, int, float, freelist, value_type, bint as bool
 from dataclasses import dataclass
 
 @cclass
 class Color(Enum):
     RED = 1
+
+@value_type
+@final
+@cclass
+@dataclass(frozen=True)
+class Vec2:
+    """A value_type used to exercise nullable value types (Vec2 | None) cross-module."""
+    x: int
+    y: int
+
+    # Plain def: promoted to cpdef automatically under auto_cpdef.
+    def add(self, other: Vec2) -> Vec2:
+        return Vec2(self.x + other.x, self.y + other.y)
+
+# Plain def functions: auto_cpdef promotes these to cpdef (C-callable cross-module).
+def opt_vec_sum(v: Vec2 | None) -> int:
+    # Takes a nullable value type by value.
+    if v is None:
+        return -1
+    return v.x + v.y  # narrowed access (no None guard after `is None` early-return)
+
+def make_opt_vec(present: bool) -> object:
+    # Returns a boxed Optional[Vec2]: None or a real Vec2 instance.
+    r: Vec2 | None = Vec2(3, 4) if present else None
+    return r
+
+def make_opt_vec_typed(present: bool) -> Vec2 | None:
+    # Returns a boxed Optional[Vec2]: None or a real Vec2 instance.
+    r: Vec2 | None = Vec2(3, 4) if present else None
+    return r
 
 @ccall
 def func_in_b():

@@ -5313,3 +5313,106 @@ class HasNoExceptionHandlingVisitor(TreeVisitor):
 
     def visit_CoerceToTempNode(self, node):
         self.visitchildren(node)
+
+
+class NullableValueNarrowingTransform(CythonTransform):
+    """Post-analysis pass: eliminate the is-None guard on NullableValueMemberNode
+    references that are provably non-None due to control flow.
+
+    Patterns recognised:
+      1. ``if x is not None: <body>``  — sets skip_none_check on all
+         NullableValueMemberNode accesses on ``x`` inside <body>.
+      2. ``assert x is not None``      — same, for all subsequent sibling
+         statements (handled by _mark_not_none_in_block below).
+    """
+
+    def __init__(self, context):
+        super().__init__(context)
+        # Set of entry objects known non-None at the current analysis point.
+        self._not_none_entries = set()
+
+    def visit_IfStatNode(self, node):
+        for clause in node.if_clauses:
+            # Check if the condition is `x is not None` for a nullable value x.
+            not_none_entry = self._get_nullable_not_none_entry(clause.condition)
+            if not_none_entry is not None:
+                old = self._not_none_entries
+                self._not_none_entries = old | {not_none_entry}
+                self.visitchildren(clause)
+                self._not_none_entries = old
+            else:
+                self.visitchildren(clause)
+        if node.else_clause:
+            self.visitchildren(node.else_clause)
+        return node
+
+    def visit_StatListNode(self, node):
+        """Walk a statement list, honouring ``assert x is not None`` narrowing."""
+        old = self._not_none_entries
+        running_not_none = set(old)
+        for stat in node.stats:
+            self._not_none_entries = running_not_none
+            self.visit(stat)
+            # After visiting, check if this stat is an assert-not-none.
+            entry = self._get_assert_not_none_entry(stat)
+            if entry is not None:
+                running_not_none = running_not_none | {entry}
+        self._not_none_entries = old
+        return node
+
+    def visit_NullableValueMemberNode(self, node):
+        # If the wrapped object's symbol-table entry is in the not-None set,
+        # we can safely skip the is-None guard.
+        if isinstance(node.obj, ExprNodes.NameNode):
+            entry = node.obj.entry
+            if entry is not None and entry in self._not_none_entries:
+                node.skip_none_check = True
+        self.visitchildren(node)
+        return node
+
+    def visit_NullableValueUnwrapNode(self, node):
+        # If the wrapped argument is a NameNode whose entry is in the not-None set,
+        # skip the is-None guard on the unwrap.
+        if isinstance(node.arg, ExprNodes.NameNode):
+            entry = node.arg.entry
+            if entry is not None and entry in self._not_none_entries:
+                node.skip_none_check = True
+        self.visitchildren(node)
+        return node
+
+    # ------------------------------------------------------------------ helpers
+
+    def _get_nullable_not_none_entry(self, condition):
+        """If *condition* is ``x is not None`` or ``x`` (truthiness of a nullable) for a
+        nullable-value local name x, return x's entry; else None."""
+        from .ExprNodes import PrimaryCmpNode, NameNode, CoerceToTempNode, NullableValueBoolNode
+        # The condition may have been wrapped in a CoerceToTempNode after analysis.
+        while isinstance(condition, CoerceToTempNode):
+            condition = condition.arg
+        # Pattern: bare nullable name used as truthiness condition (if v:)
+        # The condition will be a NullableValueBoolNode wrapping a NameNode.
+        if isinstance(condition, NullableValueBoolNode):
+            inner = condition.arg
+            while isinstance(inner, CoerceToTempNode):
+                inner = inner.arg
+            if isinstance(inner, NameNode) and getattr(inner.type, 'is_nullable_value', False):
+                return inner.entry
+        if not isinstance(condition, PrimaryCmpNode):
+            return None
+        if not getattr(condition, 'is_nullable_value_nonecheck', False):
+            return None
+        if condition.operator not in ('is_not', '!='):
+            return None
+        operand = (condition.operand1
+                   if getattr(condition.operand1.type, 'is_nullable_value', False)
+                   else condition.operand2)
+        if not isinstance(operand, NameNode):
+            return None
+        return operand.entry  # may be None for unresolved refs, that's fine
+
+    def _get_assert_not_none_entry(self, stat):
+        """If *stat* is ``assert x is not None``, return x's entry; else None."""
+        from . import Nodes as _Nodes
+        if not isinstance(stat, _Nodes.AssertStatNode):
+            return None
+        return self._get_nullable_not_none_entry(stat.condition)

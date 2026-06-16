@@ -1112,7 +1112,12 @@ class CArgDeclNode(Node):
             elif self.default and self.default.is_none and (arg_type.can_be_optional() or arg_type.equivalent_type):
                 # "x: ... = None"  =>  implicitly allow 'None'
                 if not arg_type.can_be_optional():
-                    arg_type = arg_type.boxed_type or arg_type.equivalent_type
+                    # Prefer CNullableValueType over boxing for value classes.
+                    nullable = PyrexTypes.nullable_value_type_for(env, annotation.pos, arg_type.resolve())
+                    if nullable is not None:
+                        arg_type = nullable
+                    else:
+                        arg_type = arg_type.boxed_type or arg_type.equivalent_type
                 if not self.or_none:
                     warning(self.pos, "PEP-484 recommends 'typing.Optional[...]' for arguments that can be None.")
                     self.or_none = True
@@ -1385,6 +1390,12 @@ class TemplatedTypeNode(CBaseTypeNode):
             if ttype is None:
                 continue
             if require_python_types and not ttype.is_pyobject or require_optional_types and not ttype.can_be_optional():
+                if require_optional_types and not require_python_types:
+                    # For Optional[T], prefer a CNullableValueType over boxing when T is a value class.
+                    nullable = PyrexTypes.nullable_value_type_for(env, template_node.pos, ttype.resolve())
+                    if nullable is not None:
+                        template_types[i] = nullable
+                        continue
                 boxed_type = ttype.boxed_type
                 if boxed_type:
                     template_types[i] = boxed_type
@@ -4057,6 +4068,11 @@ class DefNode(FuncDefNode):
             if env.directives['annotation_typing'] and not self.entry.is_special:
                 _, return_type = self.return_type_annotation.analyse_type_annotation(env)
                 if return_type and return_type.is_pyobject:
+                    # Note: is_nullable_value is intentionally NOT included here.
+                    # A `def` function must return PyObject*; nullable value types
+                    # (Optional[Vec2]) coerce to Python via the to_py converter just
+                    # like bare value types do.  Only @cfunc/@ccall functions (handled
+                    # by CFuncDefNode) should return the nullable struct by value.
                     self.return_type = return_type
 
         self.create_local_scope(env)
@@ -4103,7 +4119,8 @@ class DefNode(FuncDefNode):
             arg.needs_conversion = 0
             arg.needs_type_test = 0
             arg.is_generic = 1
-            if arg.type.is_pyobject or arg.type.is_buffer or arg.type.is_memoryviewslice:
+            if arg.type.is_pyobject or arg.type.is_buffer or arg.type.is_memoryviewslice or \
+                    getattr(arg.type, 'is_nullable_value', False):
                 if arg.or_none:
                     arg.accept_none = True
                 elif arg.not_none:
@@ -6892,6 +6909,13 @@ class CClassDefNode(ClassDefNode):
             for entry in scope.var_entries:
                 ftype = entry.type
                 if ftype.is_ctuple or ftype.is_struct_or_union:
+                    dep_types.add(ftype)
+                elif getattr(ftype, 'is_nullable_value', False):
+                    # Optional[InnerValueType] fields: the __pyx_optval_Inner entry
+                    # must be emitted before this value struct.  The nullable entry is
+                    # added to type_entries during body analysis (after _build_value_
+                    # class_type_shell), so it may appear after value_entry unless we
+                    # move it here.
                     dep_types.add(ftype)
             for dep in [e for e in type_entries if e.type in dep_types]:
                 if type_entries.index(dep) > type_entries.index(value_entry):

@@ -264,6 +264,7 @@ class PyrexType(BaseType):
     is_cv_qualified = 0
     is_cfunction = 0
     is_value_class = 0
+    is_nullable_value = 0
     is_struct_or_union = 0
     is_cpp_class = 0
     is_optional_cpp_class = 0
@@ -5271,6 +5272,143 @@ class CValueClassType(CStructOrUnionType):
         return "1"
 
 
+class CNullableValueType(CType):
+    #  A nullable wrapper around a CValueClassType: a C struct
+    #  { bint __pyx_is_none; <ValueType> __pyx_value; }
+    #  This avoids boxing to PyObject* when a value type is Optional.
+    #
+    #  value_type   CValueClassType   the inner non-nullable value type
+    #  scope        StructOrUnionScope or None (set by declare_nullable_value_type)
+    #  struct_entry Entry or None      the typedef entry (set by declare_nullable_value_type)
+
+    is_nullable_value = 1
+    is_value_class = 0  # deliberately NOT a value class to avoid value-class fast-path scans
+    supports_refnanny = False
+    exception_check = True
+    subtypes = []
+
+    def __init__(self, value_type, cname):
+        self.value_type = value_type
+        self.cname = cname
+        self.scope = None
+        self.struct_entry = None
+        # Per-type converters; C is emitted by ModuleNode (Phase 7).
+        self.to_py_function = "%s_to_py_%s" % (Naming.convert_func_prefix, cname)
+        self.from_py_function = "%s_from_py_%s" % (Naming.convert_func_prefix, cname)
+        # Refcount helper names; C emitted by ModuleNode alongside value-class helpers.
+        self._refcount_incref_fname = "__Pyx_INCREF_%s" % cname
+        self._refcount_decref_fname = "__Pyx_XDECREF_%s" % cname
+
+    @property
+    def boxed_type(self):
+        return self.value_type.boxed_type
+
+    @property
+    def equivalent_type(self):
+        return self.value_type.boxed_type
+
+    @property
+    def needs_refcounting(self):
+        return self.value_type.needs_refcounting
+
+    def can_be_optional(self):
+        # CRITICAL: this type *is* the optional form; always True.
+        return True
+
+    def can_coerce_to_pyobject(self, env):
+        return True
+
+    def can_coerce_from_pyobject(self, env):
+        return True
+
+    def create_to_py_utility_code(self, env):
+        # Converter C is emitted directly by ModuleNode; nothing to register here.
+        return True
+
+    def create_from_py_utility_code(self, env):
+        # Converter C is emitted directly by ModuleNode; nothing to register here.
+        return True
+
+    def declaration_code(self, entity_code,
+            for_display=0, dll_linkage=None, pyrex=0):
+        if pyrex or for_display:
+            return "%s %s" % (str(self), entity_code)
+        else:
+            return self.base_declaration_code(self.cname, entity_code)
+
+    def __str__(self):
+        return "%s | None" % self.value_type
+
+    def __repr__(self):
+        return "<CNullableValueType %s %s>" % (self.value_type, self.cname)
+
+    def same_as_resolved_type(self, other_type):
+        # Cross-module cimport_from_pyx may create separate objects; compare by cname.
+        return (other_type is error_type or
+                (getattr(other_type, 'is_nullable_value', False)
+                 and self.cname == other_type.cname))
+
+    def cast_code(self, expr_code):
+        return expr_code
+
+    # --- Refcounting interface -----------------------------------------------
+    # Mirrors CValueClassType.  When the inner value type has no refcounted
+    # fields, all operations are no-ops.  When it does, we emit calls to the
+    # per-type __Pyx_INCREF_<cname> / __Pyx_XDECREF_<cname> helpers that
+    # ModuleNode will generate (Phase 7) — they guard on is_none before touching
+    # the inner value.
+
+    def get_incref_code(self, cname, **kwds):
+        if not self.needs_refcounting:
+            return None
+        return "%s(&%s);" % (self._refcount_incref_fname, cname)
+
+    def get_xincref_code(self, cname, **kwds):
+        return self.get_incref_code(cname, **kwds)
+
+    def get_decref_code(self, cname, **kwds):
+        if not self.needs_refcounting:
+            return None
+        return "%s(&%s);" % (self._refcount_decref_fname, cname)
+
+    def get_xdecref_code(self, cname, **kwds):
+        return self.get_decref_code(cname, **kwds)
+
+    def get_decref_clear_code(self, cname, **kwds):
+        if not self.needs_refcounting:
+            return None
+        return ("%s(&%s); memset(&%s, 0, sizeof(%s));"
+                % (self._refcount_decref_fname, cname, cname, cname))
+
+    def get_xdecref_clear_code(self, cname, **kwds):
+        return self.get_decref_clear_code(cname, **kwds)
+
+    def get_decref_set_code(self, cname, rhs_cname):
+        if not self.needs_refcounting:
+            return "%s = %s;" % (cname, rhs_cname)
+        return ("%s(&%s); %s = %s;"
+                % (self._refcount_decref_fname, cname, cname, rhs_cname))
+
+    def get_xdecref_set_code(self, cname, rhs_cname):
+        return self.get_decref_set_code(cname, rhs_cname)
+
+    # Refnanny track/giveref/gotref are no-ops: no single pointer to track.
+    get_gotref_code = get_xgotref_code = get_giveref_code = get_xgiveref_code = (
+        lambda *args, **kwds: None)
+
+    def nullcheck_string(self, cname):
+        # A nullable value struct is always "present" as a struct (never null ptr).
+        # The is_none field indicates None, but there is no null-pointer concept.
+        return "1"
+
+
+def nullable_value_type_for(env, pos, inner):
+    """If `inner` is a value class, return its nullable wrapper type; else None."""
+    if inner is not None and getattr(inner, 'is_value_class', False):
+        return env.global_scope().declare_nullable_value_type(pos, inner).type
+    return None
+
+
 class UnspecifiedType(PyrexType):
     # Used as a placeholder until the type can be determined.
 
@@ -6083,6 +6221,13 @@ def spanning_type(type1, type2):
 
 
 def _spanning_type(type1, type2):
+    # Nullable value type + its inner value type → nullable (either order).
+    if getattr(type1, 'is_nullable_value', False) and getattr(type2, 'is_value_class', False):
+        if type1.value_type.same_as(type2):
+            return type1
+    if getattr(type2, 'is_nullable_value', False) and getattr(type1, 'is_value_class', False):
+        if type2.value_type.same_as(type1):
+            return type2
     if type1.is_numeric and type2.is_numeric:
         return widest_numeric_type(type1, type2)
     elif type1.is_builtin_type:

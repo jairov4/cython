@@ -843,6 +843,10 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             self.generate_objstruct_predeclaration(entry.type, code)
         vtabslot_entries = set(vtabslot_list)
         ctuple_names = set()
+        # Cross-module cimport propagates a distinct CNullableValueType entry per
+        # importing module, all sharing one cname; dedupe across modules so each
+        # nullable struct (and its operators) is emitted exactly once.
+        nullable_names = set()
         for module in modules:
             definition = module is env
             type_entries = []
@@ -850,6 +854,10 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                 if entry.type.is_ctuple and entry.used:
                     if entry.name not in ctuple_names:
                         ctuple_names.add(entry.name)
+                        type_entries.append(entry)
+                elif getattr(entry.type, 'is_nullable_value', False):
+                    if entry.type.cname not in nullable_names:
+                        nullable_names.add(entry.type.cname)
                         type_entries.append(entry)
                 elif definition or entry.defined_in_pxd:
                     type_entries.append(entry)
@@ -865,7 +873,8 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             self.generate_exttype_final_methods_declaration(entry, code)
         for module in modules:
             for entry in module.c_class_entries:
-                self.generate_value_class_converter_protos(entry, code)
+                self.generate_value_class_converter_protos(entry, code, env)
+        self.generate_nullable_value_converter_protos(env, code)
 
     def generate_declarations_for_modules(self, env, modules, globalstate):
         typecode = globalstate['type_declarations']
@@ -1126,6 +1135,8 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                     self.generate_struct_union_predeclaration(entry, code)
                 elif type.is_ctuple and not type.is_fused and entry.used:
                     self.generate_struct_union_predeclaration(entry.type.struct_entry, code)
+                elif getattr(type, 'is_nullable_value', False):
+                    self.generate_struct_union_predeclaration(type.struct_entry, code)
                 elif type.is_extension_type:
                     self.generate_objstruct_predeclaration(type, code)
         # Actual declarations
@@ -1141,6 +1152,8 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                     self.generate_struct_union_definition(entry, code)
                 elif type.is_ctuple and not type.is_fused and entry.used:
                     self.generate_struct_union_definition(entry.type.struct_entry, code)
+                elif getattr(type, 'is_nullable_value', False):
+                    self._generate_nullable_struct_definition(type, code)
                 elif type.is_cpp_class:
                     self.generate_cpp_class_definition(entry, code)
                 elif type.is_extension_type:
@@ -1243,6 +1256,27 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                 code.putln("#elif !defined(__GNUC__)")
                 code.putln("  #pragma pack(pop)")
                 code.putln("#endif")
+
+    def _generate_nullable_struct_definition(self, nullable_type, code):
+        """Emit the struct definition for a CNullableValueType, including C++
+        operator==/!= so that value-class structs embedding it can compare members."""
+        from .Naming import nullable_value_isnone_cname, value_member_cname
+        struct_entry = nullable_type.struct_entry
+        self.generate_struct_union_definition(struct_entry, code)
+        # C++ doesn't auto-generate comparison operators. The inner value_type
+        # already has operator== (emitted by generate_struct_union_definition for
+        # is_value_class structs), so we can delegate to it after checking is_none.
+        cname = nullable_type.cname
+        isnone = nullable_value_isnone_cname
+        value = value_member_cname
+        code.putln("#ifdef __cplusplus")
+        code.putln("inline bool operator==(const %s& __a, const %s& __b) {" % (cname, cname))
+        code.putln("  if (__a.%s != __b.%s) return false;" % (isnone, isnone))
+        code.putln("  if (__a.%s) return true;" % isnone)
+        code.putln("  return __a.%s == __b.%s;" % (value, value))
+        code.putln("}")
+        code.putln("inline bool operator!=(const %s& __a, const %s& __b) { return !(__a == __b); }" % (cname, cname))
+        code.putln("#endif")
 
     def generate_cpp_constructor_code(self, arg_decls, arg_names, is_implementing, py_attrs, constructor, type, code):
         if is_implementing:
@@ -1516,7 +1550,13 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             return value_type
         return None
 
-    def generate_value_class_converter_protos(self, entry, code):
+    @staticmethod
+    def _is_refcounted_value_member(t):
+        """True for value-class or nullable-value fields that carry refcounted content."""
+        return (getattr(t, 'is_value_class', False) or getattr(t, 'is_nullable_value', False)) \
+               and t.needs_refcounting
+
+    def generate_value_class_converter_protos(self, entry, code, env=None):
         value_type = self._value_class_type(entry)
         if value_type is None:
             return
@@ -1532,13 +1572,59 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             code.putln("static CYTHON_INLINE void %s(%s *); /*proto*/" % (
                 value_type._refcount_decref_fname, valstruct))
 
+    def _collect_nullable_types(self):
+        # Every nullable value type present in this translation unit, keyed by
+        # cname.  Driven by type_entries (the same source that emits the structs)
+        # so it also covers nullable types reaching this module via a cimported
+        # .pxd, which never enter this module's own nullable cache.
+        result = {}
+        for module in self.referenced_modules:
+            for entry in module.type_entries:
+                t = entry.type
+                if getattr(t, 'is_nullable_value', False) and t.cname not in result:
+                    result[t.cname] = t
+        return result
+
+    def generate_nullable_value_converter_protos(self, env, code):
+        # Emit forward declarations for every nullable wrapper present in this
+        # translation unit (NOT the value-class entry iteration, which may miss
+        # types only used as Optional[...], nor the local cache, which misses
+        # types arriving via cimport).
+        for cname, nullable_type in sorted(self._collect_nullable_types().items()):
+            optstruct = nullable_type.empty_declaration_code()
+            code.putln("static PyObject *%s(%s); /*proto*/" % (
+                nullable_type.to_py_function, optstruct))
+            code.putln("static %s %s(PyObject *); /*proto*/" % (
+                optstruct, nullable_type.from_py_function))
+            if nullable_type.needs_refcounting:
+                code.putln("static CYTHON_INLINE void %s(%s *); /*proto*/" % (
+                    nullable_type._refcount_incref_fname, optstruct))
+                code.putln("static CYTHON_INLINE void %s(%s *); /*proto*/" % (
+                    nullable_type._refcount_decref_fname, optstruct))
+
     def generate_value_class_converters(self, env, code):
+        # Map value-type cname -> its nullable wrapper type, for every nullable
+        # present in this translation unit (covers local, used-cimported, and
+        # cimported-via-pxd cases uniformly).
+        nullable_by_value = {
+            nt.value_type.cname: nt for nt in self._collect_nullable_types().values()}
+        emitted_value = set()
+        emitted_nullable = set()
+
+        def emit(entry, value_type):
+            if value_type.cname not in emitted_value:
+                emitted_value.add(value_type.cname)
+                self._generate_value_class_converters(entry, value_type, code)
+            nullable_type = nullable_by_value.get(value_type.cname)
+            if nullable_type is not None and value_type.cname not in emitted_nullable:
+                emitted_nullable.add(value_type.cname)
+                self._generate_nullable_value_converters(value_type, nullable_type, code)
+
         # Generate converters for locally-defined value_type classes.
         for entry in env.c_class_entries:
             value_type = self._value_class_type(entry)
-            if value_type is None:
-                continue
-            self._generate_value_class_converters(entry, value_type, code)
+            if value_type is not None:
+                emit(entry, value_type)
         # Also regenerate converters for cimported value_type classes: the producer's
         # converters are static and reference the producer's module-state typeptr, so
         # the consumer must emit its own copy using its own cimported typeptr.
@@ -1549,9 +1635,21 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                 if not entry.used or not entry.defined_in_pxd:
                     continue
                 value_type = self._value_class_type(entry)
-                if value_type is None:
-                    continue
-                self._generate_value_class_converters(entry, value_type, code)
+                if value_type is not None:
+                    emit(entry, value_type)
+        # A module may use Optional[ValueType] (needing the nullable converters)
+        # without the underlying value class entry being marked 'used', or with
+        # the nullable type arriving via a cimported .pxd (absent from the local
+        # cache).  Drive emission from every nullable type actually present in
+        # this translation unit so the converters always exist where referenced.
+        for cname, nullable_type in sorted(nullable_by_value.items()):
+            value_type = nullable_type.value_type
+            if value_type.cname in emitted_nullable:
+                continue
+            boxed_entry = getattr(value_type.boxed_type, 'entry', None)
+            if boxed_entry is None:
+                continue
+            emit(boxed_entry, value_type)
 
     def _generate_value_class_converters(self, entry, value_type, code):
         ext_type = entry.type
@@ -1598,6 +1696,56 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         code.putln("return r;")
         code.putln("}")
 
+    def _generate_nullable_value_converters(self, value_type, nullable_type, code):
+        """Emit to_py / from_py (and optionally INCREF/XDECREF) for a CNullableValueType."""
+        from Cython.Compiler.Code import UtilityCode
+        code.globalstate.use_utility_code(
+            UtilityCode.load_cached("IncludeStringH", "StringTools.c"))
+        optstruct = nullable_type.empty_declaration_code()
+        isnone = Naming.nullable_value_isnone_cname
+        vmember = Naming.value_member_cname
+
+        # to_py: None when is_none, else box the inner value.
+        code.putln("static PyObject *%s(%s v) {" % (nullable_type.to_py_function, optstruct))
+        code.putln("if (v.%s) { Py_INCREF(Py_None); return Py_None; }" % isnone)
+        code.putln("return %s(v.%s);" % (value_type.to_py_function, vmember))
+        code.putln("}")
+
+        # from_py: None → is_none=1, else delegate to inner from_py.
+        code.putln("static %s %s(PyObject *o) {" % (optstruct, nullable_type.from_py_function))
+        code.putln("%s r;" % optstruct)
+        code.putln("if (o == Py_None) {")
+        code.putln("r.%s = 1;" % isnone)
+        code.putln("memset(&r.%s, 0, sizeof(r.%s));" % (vmember, vmember))
+        code.putln("} else {")
+        code.putln("r.%s = 0;" % isnone)
+        code.putln("r.%s = %s(o);" % (vmember, value_type.from_py_function))
+        code.putln("}")
+        code.putln("return r;")
+        code.putln("}")
+
+        # Optional refcount helpers.
+        if nullable_type.needs_refcounting:
+            self._generate_nullable_value_refcount_helpers(value_type, nullable_type, code)
+
+    def _generate_nullable_value_refcount_helpers(self, value_type, nullable_type, code):
+        """Emit INCREF/XDECREF helpers for a refcounted CNullableValueType."""
+        optstruct = nullable_type.empty_declaration_code()
+        isnone = Naming.nullable_value_isnone_cname
+        vmember = Naming.value_member_cname
+
+        code.putln("static CYTHON_INLINE void %s(%s *v) {" % (
+            nullable_type._refcount_incref_fname, optstruct))
+        code.putln("if (!v->%s) %s(&v->%s);" % (
+            isnone, value_type._refcount_incref_fname, vmember))
+        code.putln("}")
+
+        code.putln("static CYTHON_INLINE void %s(%s *v) {" % (
+            nullable_type._refcount_decref_fname, optstruct))
+        code.putln("if (!v->%s) %s(&v->%s);" % (
+            isnone, value_type._refcount_decref_fname, vmember))
+        code.putln("}")
+
     def _generate_value_class_refcount_helpers(self, value_type, code):
         """Emit __Pyx_INCREF_<cname> and __Pyx_XDECREF_<cname> for a value class
         that has refcounted fields (pyobject, memoryview, or nested value_type)."""
@@ -1612,6 +1760,8 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                 code.putln("Py_XINCREF(v->%s);" % f.cname)
             elif getattr(ftype, 'is_value_class', False) and ftype.needs_refcounting:
                 code.putln("%s(&v->%s);" % (ftype._refcount_incref_fname, f.cname))
+            elif getattr(ftype, 'is_nullable_value', False) and ftype.needs_refcounting:
+                code.putln("%s(&v->%s);" % (ftype._refcount_incref_fname, f.cname))
             elif ftype.is_memoryviewslice:
                 code.putln("__PYX_INC_MEMVIEW(&v->%s, 1);" % f.cname)
         code.putln("}")
@@ -1624,6 +1774,8 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             if ftype.is_pyobject:
                 code.putln("Py_XDECREF(v->%s);" % f.cname)
             elif getattr(ftype, 'is_value_class', False) and ftype.needs_refcounting:
+                code.putln("%s(&v->%s);" % (ftype._refcount_decref_fname, f.cname))
+            elif getattr(ftype, 'is_nullable_value', False) and ftype.needs_refcounting:
                 code.putln("%s(&v->%s);" % (ftype._refcount_decref_fname, f.cname))
             elif ftype.is_memoryviewslice:
                 code.putln("__PYX_XCLEAR_MEMVIEW(&v->%s, 1);" % f.cname)
@@ -2082,10 +2234,10 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             dict_slot = None
 
         _, (py_attrs, _, memoryview_slices) = scope.get_refcounted_entries()
-        # Also collect nested refcounted value_type fields that need explicit cleanup.
+        # Also collect nested refcounted value_type / nullable-value fields that need explicit cleanup.
         refcounted_value_attrs = [
             entry for entry in scope.var_entries
-            if getattr(entry.type, 'is_value_class', False) and entry.type.needs_refcounting
+            if self._is_refcounted_value_member(entry.type)
         ]
         explicitly_destructable_attrs = [
             entry for entry in scope.var_entries
@@ -2280,7 +2432,7 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
 
         refcounted_value_attrs = [
             entry for entry in scope.var_entries
-            if entry.type.is_value_class and entry.type.needs_refcounting
+            if self._is_refcounted_value_member(entry.type)
         ]
 
         needs_type_traverse = not base_type
@@ -2372,6 +2524,15 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             elif field.type.is_value_class and field.type.needs_refcounting:
                 self._generate_value_class_traverse_fields(
                     "%s.%s" % (prefix, field.cname), field.type, code)
+            elif getattr(field.type, 'is_nullable_value', False) and field.type.needs_refcounting:
+                # Traverse the inner value only when not-None.
+                field_prefix = "%s.%s" % (prefix, field.cname)
+                isnone = Naming.nullable_value_isnone_cname
+                vmember = Naming.value_member_cname
+                code.putln("if (!%s.%s) {" % (field_prefix, isnone))
+                self._generate_value_class_traverse_fields(
+                    "%s.%s" % (field_prefix, vmember), field.type.value_type, code)
+                code.putln("}")
 
     def generate_clear_function(self, scope, code, cclass_entry):
         tp_slot = TypeSlots.get_slot_by_name("tp_clear", scope.directives)
@@ -2385,7 +2546,7 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
 
         refcounted_value_attrs = [
             entry for entry in scope.var_entries
-            if entry.type.is_value_class and entry.type.needs_refcounting
+            if self._is_refcounted_value_member(entry.type)
         ]
 
         if py_attrs or py_buffers or base_type or refcounted_value_attrs:
@@ -2466,6 +2627,15 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             elif field.type.is_value_class and field.type.needs_refcounting:
                 self._generate_value_class_clear_fields(
                     "%s.%s" % (prefix, field.cname), field.type, code)
+            elif getattr(field.type, 'is_nullable_value', False) and field.type.needs_refcounting:
+                # Clear the inner value only when not-None.
+                field_prefix = "%s.%s" % (prefix, field.cname)
+                isnone = Naming.nullable_value_isnone_cname
+                vmember = Naming.value_member_cname
+                code.putln("if (!%s.%s) {" % (field_prefix, isnone))
+                self._generate_value_class_clear_fields(
+                    "%s.%s" % (field_prefix, vmember), field.type.value_type, code)
+                code.putln("}")
 
     def generate_getitem_function(self, scope, code):
         # Implement 'sq_item()' and/or 'mp_subscript()', whichever is more suitable.

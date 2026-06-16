@@ -1,0 +1,248 @@
+# Tests cross-module nullable value_type support via --cimport-from-pyx.
+# The producer (mod_a) defines Vec2 as a value_type.
+# The consumer (mod_b) cimports Vec2 and uses Optional[Vec2] as:
+#   - a function parameter (both def and @cfunc)
+#   - a local variable
+#   - a @cclass attribute
+#   - a @cfunc return type
+# check_codegen.py asserts that:
+#   - the consumer's generated C contains the optval struct
+#   - the nullable converters are static (regenerated) in the consumer TU
+CYTHON --cimport-from-pyx mod_a.pyx mod_b.pyx
+PYTHON check_codegen.py
+PYTHON build_mods.py
+PYTHON run_test.py
+
+######## mod_a.pyx ########
+
+# cython: language_level=3
+cimport cython
+from dataclasses import dataclass
+
+
+@cython.value_type
+@cython.final
+@dataclass(frozen=True)
+cdef class Vec2:
+    x: cython.double
+    y: cython.double
+
+    cpdef double mag2(self):
+        return self.x * self.x + self.y * self.y
+
+
+cpdef Vec2 make_vec(double x, double y):
+    return Vec2(x, y)
+
+######## mod_b.pyx ########
+
+# cython: language_level=3
+cimport cython
+from mod_a cimport Vec2
+from typing import Optional
+
+
+@cython.cclass
+class Box:
+    slot: Optional[Vec2]
+
+    def __init__(self, slot: Optional[Vec2]) -> None:
+        self.slot = slot
+
+    def get_x(self) -> cython.double:
+        if self.slot is not None:
+            return self.slot.x
+        return -1.0
+
+    def set_slot(self, slot: Optional[Vec2]) -> None:
+        self.slot = slot
+
+
+@cython.cfunc
+def _maybe_scale(o: Optional[Vec2], factor: cython.double) -> Optional[Vec2]:
+    if o is None:
+        return None
+    return Vec2(o.x * factor, o.y * factor)
+
+
+def scale_or_none(o: Optional[Vec2], factor: cython.double) -> object:
+    result: Optional[Vec2] = _maybe_scale(o, factor)
+    if result is None:
+        return None
+    boxed: object = result
+    return boxed
+
+
+def make_box(x: object, y: object) -> Box:
+    # Construct Vec2 from Python scalars; store as Optional[Vec2] in Box.
+    v: Vec2 = Vec2(x, y)
+    return Box(v)
+
+
+def make_empty_box() -> Box:
+    return Box(None)
+
+
+def get_box_x(b: Box) -> object:
+    return b.get_x()
+
+
+def swap_box(b: Box, x: object, y: object) -> None:
+    b.set_slot(Vec2(x, y))
+
+
+def local_var_test(x_val: cython.double, y_val: cython.double) -> object:
+    """Test Optional[Vec2] local variable in a def function."""
+    opt: Optional[Vec2] = Vec2(x_val, y_val)
+    if opt is None:
+        return None
+    # Narrowed access
+    ret_x: cython.double = opt.x
+    return ret_x
+
+
+def pass_none_test() -> object:
+    """Test passing None as Optional[Vec2]."""
+    opt: Optional[Vec2] = None
+    return scale_or_none(opt, 2.0)
+
+
+######## check_codegen.py ########
+# Asserts that mod_b.c contains:
+#  1. The optval struct for Vec2 (cross-module, from mod_a)
+#  2. Static (regenerated) nullable converters in the consumer TU
+
+with open('mod_b.c') as f:
+    src = f.read()
+
+VAL_STRUCT = '__pyx_val_5mod_a_Vec2'
+OPT_STRUCT = '__pyx_optval___pyx_val_5mod_a_Vec2'
+CONV_TO    = '__pyx_convert__to_py_%s' % OPT_STRUCT
+CONV_FROM  = '__pyx_convert__from_py_%s' % OPT_STRUCT
+
+# 1. Value struct typedef in consumer
+assert VAL_STRUCT in src, \
+    "consumer missing value struct typedef %s" % VAL_STRUCT
+
+typedef_lines = [l for l in src.splitlines()
+                 if 'typedef' in l and VAL_STRUCT in l]
+assert typedef_lines, "no typedef line for %s" % VAL_STRUCT
+
+# 2. Optval struct in consumer
+assert OPT_STRUCT in src, \
+    "consumer missing optval struct %s" % OPT_STRUCT
+
+opt_struct_defs = [l for l in src.splitlines()
+                   if ('struct %s' % OPT_STRUCT) in l and '{' in l]
+assert opt_struct_defs, \
+    "no struct definition for %s in consumer" % OPT_STRUCT
+
+# 3. Nullable converters regenerated as static in consumer
+assert CONV_TO in src, \
+    "consumer missing nullable to_py converter %s" % CONV_TO
+assert CONV_FROM in src, \
+    "consumer missing nullable from_py converter %s" % CONV_FROM
+
+conv_to_lines = [l for l in src.splitlines()
+                 if CONV_TO in l and ('static' in l or '/*proto*/' in l)]
+assert conv_to_lines, \
+    "nullable to_py converter not static/proto in consumer"
+
+conv_from_lines = [l for l in src.splitlines()
+                   if CONV_FROM in l and ('static' in l or '/*proto*/' in l)]
+assert conv_from_lines, \
+    "nullable from_py converter not static/proto in consumer"
+
+# 4. The optval struct has the expected layout (is_none + value members)
+is_none_lines = [l for l in src.splitlines()
+                 if '__pyx_is_none' in l and OPT_STRUCT in src]
+assert any('__pyx_is_none' in l for l in src.splitlines()), \
+    "nullable struct missing __pyx_is_none member"
+
+print("OK: cross-module nullable value_type codegen assertions passed")
+
+######## build_mods.py ########
+
+import sys
+import os
+import sysconfig
+import subprocess
+
+inc = sysconfig.get_paths()['include']
+ldshared = sysconfig.get_config_var('LDSHARED') or ''
+cc = sysconfig.get_config_var('CC') or 'cc'
+ccshared = sysconfig.get_config_var('CCSHARED') or '-fPIC'
+ext = sysconfig.get_config_var('EXT_SUFFIX') or '.so'
+
+# Step 1: build mod_a.so
+mod_a_so = 'mod_a' + ext
+if os.path.exists(mod_a_so):
+    os.remove(mod_a_so)
+cmd = f'{ldshared} -O0 -I{inc} mod_a.c -o {mod_a_so}'
+ret = subprocess.call(cmd, shell=True)
+if ret != 0:
+    print('ERROR: failed to build mod_a', file=sys.stderr)
+    sys.exit(1)
+print(f'Built {mod_a_so}')
+
+# Step 2: compile mod_a.c to .o (for linking into mod_b)
+mod_a_obj = 'mod_a_pic.o'
+cmd = f'{cc} {ccshared} -O0 -I{inc} -c mod_a.c -o {mod_a_obj}'
+ret = subprocess.call(cmd, shell=True)
+if ret != 0:
+    print('ERROR: failed to compile mod_a.c to object', file=sys.stderr)
+    sys.exit(1)
+print(f'Compiled {mod_a_obj}')
+
+# Step 3: build mod_b.so linked against mod_a object
+mod_b_so = 'mod_b' + ext
+if os.path.exists(mod_b_so):
+    os.remove(mod_b_so)
+cmd = f'{ldshared} -O0 -I{inc} mod_b.c {mod_a_obj} -o {mod_b_so}'
+ret = subprocess.call(cmd, shell=True)
+if ret != 0:
+    print('ERROR: failed to build mod_b', file=sys.stderr)
+    sys.exit(1)
+print(f'Built {mod_b_so}')
+
+######## run_test.py ########
+
+import sys
+sys.path.insert(0, '.')
+
+import mod_a
+import mod_b
+
+# --- Basic nullable param tests ---
+v1 = mod_a.make_vec(3.0, 4.0)
+
+# scale_or_none with a real Vec2
+r1 = mod_b.scale_or_none(v1, 2.0)
+assert r1 is not None, "scale_or_none(v1, 2.0) returned None"
+assert isinstance(r1, mod_a.Vec2), "scale_or_none result not Vec2: %r" % type(r1)
+assert abs(r1.x - 6.0) < 1e-9, "scale_or_none.x wrong: %r" % r1.x
+
+# scale_or_none with None
+r2 = mod_b.scale_or_none(None, 2.0)
+assert r2 is None, "scale_or_none(None) should return None, got %r" % r2
+
+# --- @cclass attribute tests ---
+box = mod_b.make_box(1.0, 2.0)
+assert isinstance(box, mod_b.Box), "make_box result not Box"
+assert abs(mod_b.get_box_x(box) - 1.0) < 1e-9, "box.get_x() wrong"
+
+empty = mod_b.make_empty_box()
+assert abs(mod_b.get_box_x(empty) - (-1.0)) < 1e-9, "empty box get_x should be -1.0"
+
+mod_b.swap_box(empty, 5.0, 6.0)
+assert abs(mod_b.get_box_x(empty) - 5.0) < 1e-9, "after swap_box, get_x should be 5.0"
+
+# --- Local variable test ---
+r3 = mod_b.local_var_test(7.0, 8.0)
+assert r3 is not None and abs(r3 - 7.0) < 1e-9, "local_var_test wrong: %r" % r3
+
+# --- Pass None test ---
+r4 = mod_b.pass_none_test()
+assert r4 is None, "pass_none_test should return None, got %r" % r4
+
+print("DONE: value_type nullable cross-module tests passed")

@@ -1096,6 +1096,35 @@ class ExprNode(Node):
             deref = deref.analyse_types(env)
             src = deref.coerce_to(dst_type, env)
 
+        elif getattr(dst_type, 'is_nullable_value', False):
+            if getattr(src_type, 'is_error', False):
+                # Propagate earlier errors without crashing.
+                pass
+            elif src.is_none:
+                # None -> nullable: set is_none=1, zero value payload
+                src = NullableValueCoercionNode(src, dst_type, is_none=True)
+            elif (getattr(src.type, 'is_nullable_value', False)
+                  and src.type.same_as(dst_type)):
+                # Same nullable type: no-op
+                pass
+            elif (getattr(src.type, 'is_value_class', False)
+                  and src.type.same_as(dst_type.value_type)):
+                # Inner value class -> wrap in nullable struct with is_none=0
+                src = NullableValueCoercionNode(src, dst_type, is_none=False)
+            elif src_type.is_pyobject:
+                # Python object -> go through from_py converter (Phase 7)
+                src = CoerceFromPyTypeNode(dst_type, src, env)
+            else:
+                self.fail_assignment(dst_type)
+
+        elif (getattr(src_type, 'is_nullable_value', False)
+              and not getattr(src_type, 'is_error', False)
+              and not getattr(dst_type, 'is_error', False)
+              and getattr(dst_type, 'is_value_class', False)
+              and src_type.value_type.same_as(dst_type)):
+            # Nullable value type -> inner value type: unwrap with None guard.
+            src = NullableValueUnwrapNode(src, dst_type)
+
         elif dst_type.is_pyobject:
             # We never need a type check when assigning None to a Python object type.
             if src.is_none:
@@ -1219,6 +1248,13 @@ class ExprNode(Node):
                     args=[]).analyse_types(env)
             # No __bool__: box and use Python truth-testing.
             return self.coerce_to_pyobject(env).coerce_to_boolean(env)
+        elif getattr(type, 'is_nullable_value', False):
+            # bool(opt) = !opt.is_none && <inner truthiness>
+            # Check if the inner value class defines __bool__ via the boxed type's scope.
+            inner_type = type.value_type
+            boxed_scope = getattr(getattr(type, 'boxed_type', None), 'scope', None)
+            has_inner_bool = boxed_scope is not None and boxed_scope.lookup("__bool__") is not None
+            return NullableValueBoolNode(self, type, has_inner_bool).analyse_types(env)
         else:
             error(self.pos, "Type '%s' not acceptable as a boolean" % type)
             return self
@@ -1411,7 +1447,8 @@ class NoneNode(PyConstNode):
         return True
 
     def coerce_to(self, dst_type, env):
-        if not (dst_type.is_pyobject or dst_type.is_memoryviewslice or dst_type.is_error):
+        if not (dst_type.is_pyobject or dst_type.is_memoryviewslice or dst_type.is_error
+                or getattr(dst_type, 'is_nullable_value', False)):
             # Catch this error early and loudly.
             error(self.pos, "Cannot assign None to %s" % dst_type)
         return super().coerce_to(dst_type, env)
@@ -8278,6 +8315,38 @@ class MergedDictNode(ExprNode):
             item.annotate(code)
 
 
+def _nullable_value_is_not_none(node):
+    """Return True if *node* (whose type is_nullable_value) is provably non-None.
+
+    Checks control-flow state: if the node is a NameNode whose cf_state
+    assignments all have may_be_none()==False for a nullable value type, the
+    slot is known non-None.  Also returns True when the node itself is a
+    NullableValueCoercionNode with is_none=False (direct value assignment).
+    """
+    if isinstance(node, NullableValueCoercionNode) and not node.is_none_value:
+        return True
+    if isinstance(node, NameNode) and node.cf_state is not None:
+        if getattr(node, '_none_checking', False):
+            return False
+        node._none_checking = True
+        try:
+            for assignment in node.cf_state:
+                if _nullable_rhs_may_be_none(assignment.rhs):
+                    return False
+        finally:
+            del node._none_checking
+        return True
+    return False
+
+
+def _nullable_rhs_may_be_none(rhs):
+    """Return True if *rhs* (an assignment rhs node for a nullable value) may be None."""
+    if isinstance(rhs, NullableValueCoercionNode):
+        return rhs.is_none_value
+    # Fall back to node's own may_be_none()
+    return rhs.may_be_none()
+
+
 class AttributeNode(ExprNode):
     #  obj.attribute
     #
@@ -8408,6 +8477,10 @@ class AttributeNode(ExprNode):
         obj_type = self.obj.infer_type(env)
         if obj_type is None:
             return py_object_type
+        if getattr(obj_type, 'is_nullable_value', False):
+            # For inference: look up the attribute against the inner value type
+            # (the actual rewrite happens in analyse_as_ordinary_attribute_node).
+            obj_type = obj_type.value_type
         self.analyse_attribute(env, obj_type=obj_type)
         if obj_type.is_builtin_type and self.type.is_cfunction:
             # special case: C-API replacements for C methods of
@@ -8651,6 +8724,23 @@ class AttributeNode(ExprNode):
                 self.type = py_object_type
                 self.is_temp = 1
                 return self
+        if getattr(self.obj.type, 'is_nullable_value', False):
+            # Unwrap the nullable value to its inner value type, emitting an
+            # is-None guard unless the object is proven non-None by control flow.
+            if target:
+                # Frozen dataclasses: assignment to fields of a nullable is
+                # disallowed (as with the non-nullable value type).
+                error(self.pos,
+                      "cannot assign to field '%s' of nullable value type '%s'"
+                      % (self.attribute, self.obj.type))
+                self.type = PyrexTypes.error_type
+                return self
+            nullable_obj = self.obj
+            skip = _nullable_value_is_not_none(nullable_obj)
+            unwrap = NullableValueMemberNode(
+                self.pos, nullable_obj, attribute_name=self.attribute)
+            unwrap.skip_none_check = skip
+            self.obj = unwrap
         self.analyse_attribute(env)
         if self.entry and self.entry.is_cmethod and not self.is_called:
 #            error(self.pos, "C method can only be called")
@@ -13961,6 +14051,10 @@ class BitwiseOrNode(IntBinopNode):
         if not ttype:
             return None
         if not ttype.can_be_optional():
+            # Prefer CNullableValueType over boxing for value classes.
+            nullable = PyrexTypes.nullable_value_type_for(env, operand_node.pos, ttype.resolve())
+            if nullable is not None:
+                return nullable
             # If ttype cannot be optional we need to return a boxed Python type allowing None.
             # If it cannot be boxed, fall back to any known Python equivalent.
             if ttype.boxed_type:
@@ -14733,6 +14827,16 @@ class BoolBinopNode(ExprNode):
                     test_result,
                     self.operand1.py_result(),
                     code.error_goto_if_neg(test_result, self.pos)))
+            return (test_result, True)
+        elif getattr(self.type, 'is_nullable_value', False):
+            # Nullable struct: truth = !is_none.
+            test_result = code.funcstate.allocate_temp(
+                PyrexTypes.c_bint_type, manage_ref=False)
+            code.putln("%s = (!%s.%s);" % (
+                test_result,
+                self.operand1.result(),
+                Naming.nullable_value_isnone_cname))
+            return (test_result, True)
         else:
             test_result = self.operand1.result()
         return (test_result, self.type.is_pyobject)
@@ -14790,6 +14894,16 @@ class BoolBinopResultNode(ExprNode):
                     test_result,
                     self.arg.py_result(),
                     code.error_goto_if_neg(test_result, self.pos)))
+            return (test_result, True)
+        elif getattr(self.arg.type, 'is_nullable_value', False):
+            # Nullable struct: truth = !is_none (no inner __bool__ needed for short-circuit).
+            test_result = code.funcstate.allocate_temp(
+                PyrexTypes.c_bint_type, manage_ref=False)
+            code.putln("%s = (!%s.%s);" % (
+                test_result,
+                self.arg.result(),
+                Naming.nullable_value_isnone_cname))
+            return (test_result, True)
         else:
             test_result = self.arg.result()
         return (test_result, self.arg.type.is_pyobject)
@@ -14920,6 +15034,13 @@ class CondExprNode(ExprNode):
                 error(self.false_val.pos, "Unsafe C derivative of temporary Python reference used in conditional expression")
 
         if true_val_type.is_pyobject or false_val_type.is_pyobject or self.type.is_pyobject:
+            if true_val_type != self.type:
+                self.true_val = self.true_val.coerce_to(self.type, env)
+            if false_val_type != self.type:
+                self.false_val = self.false_val.coerce_to(self.type, env)
+        elif getattr(self.type, 'is_nullable_value', False):
+            # Nullable value type spanning: coerce each branch to the nullable type
+            # (e.g. Vec2 -> Vec2|None wraps; same nullable passes through).
             if true_val_type != self.type:
                 self.true_val = self.true_val.coerce_to(self.type, env)
             if false_val_type != self.type:
@@ -15435,6 +15556,7 @@ class PrimaryCmpNode(ExprNode, CmpNode):
     cascade = None
     coerced_operand2 = None
     is_memslice_nonecheck = False
+    is_nullable_value_nonecheck = False
 
     def _richcmp_cpdef_entry(self, env):
         """Return a cpdef entry for this comparison if both operands are statically known."""
@@ -15548,6 +15670,9 @@ class PrimaryCmpNode(ExprNode, CmpNode):
                         return call.analyse_types(env)
 
         if self.analyse_memoryviewslice_comparison(env):
+            return self
+
+        if self.analyse_nullable_value_comparison(env):
             return self
 
         if self.cascade:
@@ -15670,6 +15795,71 @@ class PrimaryCmpNode(ExprNode, CmpNode):
 
         return False
 
+    def analyse_nullable_value_comparison(self, env):
+        """Handle comparisons involving CNullableValueType operands.
+
+        Two sub-cases:
+        1. `opt is/== None` / `opt is_not/!= None` — one operand is the None
+           literal.  Lowers to a direct .is_none field check (fast path).
+        2. `opt == value` / `opt != value` / `opt == opt2` / `opt != opt2` —
+           neither operand is the None literal, but at least one is a nullable
+           value type and the other is either a nullable value type or the
+           matching bare CValueClassType.  Box both operands to Python objects
+           and let Python richcmp handle the semantics (None==value→False,
+           value==value→inner.__eq__, etc.).
+        """
+        have_none = self.operand1.is_none or self.operand2.is_none
+        t1 = self.operand1.type
+        t2 = self.operand2.type
+        is_nullable1 = getattr(t1, 'is_nullable_value', False)
+        is_nullable2 = getattr(t2, 'is_nullable_value', False)
+        have_nullable = is_nullable1 or is_nullable2
+        if not have_nullable:
+            return False
+
+        ops_none = ('==', '!=', 'is', 'is_not')
+        ops_eq = ('==', '!=')
+
+        # Sub-case 1: one operand is the None literal → fast .is_none check.
+        if have_none and self.operator in ops_none:
+            if self.cascade:
+                error(self.pos,
+                      "Cascading comparison not supported for nullable value types")
+                return False
+            self.type = PyrexTypes.c_bint_type
+            self.is_nullable_value_nonecheck = True
+            return True
+
+        # Sub-case 2: ==/ != between (nullable, nullable) or (nullable, bare value).
+        # Neither operand is a None literal here.
+        if self.operator not in ops_eq:
+            return False
+
+        # Determine the inner CValueClassType for each nullable operand.
+        inner1 = getattr(t1, 'value_type', None) if is_nullable1 else (t1 if getattr(t1, 'is_value_class', False) else None)
+        inner2 = getattr(t2, 'value_type', None) if is_nullable2 else (t2 if getattr(t2, 'is_value_class', False) else None)
+
+        # We require at least one nullable and the other to be the *same* inner
+        # value class (or nullable wrapping the same inner value class), to avoid
+        # accidentally activating this path for unrelated types.
+        if inner1 is None or inner2 is None:
+            return False
+        if not inner1.same_as(inner2):
+            return False
+        # At this point we know: (nullable==nullable) or (nullable==bare value) or
+        # (bare value==nullable).  Cascade is not supported.
+        if self.cascade:
+            error(self.pos,
+                  "Cascading comparison not supported for nullable value types")
+            return False
+
+        # Box both operands to Python objects and use Python richcmp.
+        self.operand1 = self.operand1.coerce_to_pyobject(env)
+        self.operand2 = self.operand2.coerce_to_pyobject(env)
+        self.type = PyrexTypes.c_bint_type
+        self.is_temp = True
+        return True
+
     def coerce_to_boolean(self, env):
         if self.type is PyrexTypes.c_bint_type:
             return self
@@ -15737,6 +15927,14 @@ class PrimaryCmpNode(ExprNode, CmpNode):
                         result1 = "((PyObject *) %s.memview)" % result1
                     else:
                         result2 = "((PyObject *) %s.memview)" % result2
+                elif self.is_nullable_value_nonecheck:
+                    # Lower `opt is/== None` to a direct .is_none field check.
+                    # c_operator already maps 'is'->'==' and 'is_not'->'!='.
+                    c_op = self.c_operator(self.operator)
+                    if getattr(operand1.type, 'is_nullable_value', False):
+                        return "(%s.%s %s 1)" % (result1, Naming.nullable_value_isnone_cname, c_op)
+                    else:
+                        return "(%s.%s %s 1)" % (result2, Naming.nullable_value_isnone_cname, c_op)
 
             return "(%s %s %s)" % (
                 result1,
@@ -15970,6 +16168,203 @@ class CoerceToMemViewSliceNode(CoercionNode):
             self.pos,
             code
         ))
+
+
+class NullableValueCoercionNode(CoercionNode):
+    """
+    Coerce a value or None into a CNullableValueType struct.
+
+    When is_none=True: produces { .__pyx_is_none=1, .__pyx_value=zeroed }.
+    When is_none=False: produces { .__pyx_is_none=0, .__pyx_value=<inner value> }.
+    """
+
+    is_none_value = False
+
+    def __init__(self, arg, dst_type, is_none):
+        assert getattr(dst_type, 'is_nullable_value', False)
+        CoercionNode.__init__(self, arg)
+        self.type = dst_type
+        self.is_none_value = is_none
+        self.is_temp = 1
+
+    def analyse_types(self, env):
+        return self
+
+    def may_be_none(self):
+        return self.is_none_value
+
+    def generate_result_code(self, code):
+        if self.is_none_value:
+            # None branch: mark is_none=1, zero value payload
+            code.globalstate.use_utility_code(
+                UtilityCode.load_cached("IncludeStringH", "StringTools.c"))
+            code.putln("%s.%s = 1;" % (self.result(), Naming.nullable_value_isnone_cname))
+            code.putln("memset(&%s.%s, 0, sizeof(%s.%s));" % (
+                self.result(), Naming.value_member_cname,
+                self.result(), Naming.value_member_cname))
+        else:
+            # Value branch: mark is_none=0, copy inner value
+            code.putln("%s.%s = 0;" % (self.result(), Naming.nullable_value_isnone_cname))
+            inner_type = self.type.value_type
+            if self.type.needs_refcounting:
+                # Take ownership: make_owned_reference increments if needed
+                self.arg.make_owned_reference(code)
+            code.putln("%s.%s = %s;" % (
+                self.result(),
+                Naming.value_member_cname,
+                self.arg.result_as(inner_type)))
+
+class NullableValueBoolNode(CoercionNode):
+    """
+    Implements bool(opt) for a CNullableValueType:
+      (!opt.__pyx_is_none && <inner __bool__ or always-true>)
+
+    When has_inner_bool is True, we call the inner value class's __bool__
+    on the .value member (via boxing to Python and using Python truthiness).
+    When False, any non-None value is truthy: result = !is_none.
+    """
+
+    type = PyrexTypes.c_bint_type
+    subexprs = ['arg']
+    is_temp = 1
+
+    def __init__(self, arg, nullable_type, has_inner_bool):
+        CoercionNode.__init__(self, arg)
+        self.nullable_type = nullable_type
+        self.has_inner_bool = has_inner_bool
+
+    def analyse_types(self, env):
+        return self
+
+    def generate_result_code(self, code):
+        # First check is_none; if None, result is 0.
+        # If not None, check inner __bool__ or just assign 1.
+        isnone = "%s.%s" % (self.arg.result(), Naming.nullable_value_isnone_cname)
+        if not self.has_inner_bool:
+            # !is_none is sufficient
+            code.putln("%s = (!%s);" % (self.result(), isnone))
+        else:
+            # TODO: invoke inner __bool__ directly via value-class vtable when possible.
+            # For now: if not None, box the inner value and test Python truthiness.
+            # This is correct but suboptimal; a future pass can make it direct.
+            inner_val = "%s.%s" % (self.arg.result(), Naming.value_member_cname)
+            inner_type = self.nullable_type.value_type
+            boxed_type = self.nullable_type.boxed_type
+            # Use a temp PyObject*
+            py_temp = code.funcstate.allocate_temp(PyrexTypes.py_object_type, manage_ref=True)
+            code.putln("if (!%s) {" % isnone)
+            # Box the inner value
+            code.putln("%s = %s(%s);" % (
+                py_temp,
+                inner_type.to_py_function,
+                inner_val))
+            code.putln("if (!%s) { %s = 0; } else {" % (py_temp, self.result()))
+            code.putln("%s = __Pyx_PyObject_IsTrue(%s);" % (self.result(), py_temp))
+            code.put_xdecref_clear(py_temp, PyrexTypes.py_object_type)
+            code.putln("}")  # close else
+            code.putln("} else {")
+            code.putln("%s = 0;" % self.result())
+            code.putln("}")
+            code.funcstate.release_temp(py_temp)
+
+
+class NullableValueMemberNode(ExprNode):
+    """
+    Unwrap a CNullableValueType to its inner CValueClassType member.
+
+    Yields ``obj.__pyx_value`` of type ``value_type``.  Unless
+    ``skip_none_check`` is True, ``generate_result_code`` first emits a
+    runtime ``__pyx_is_none`` guard that raises AttributeError.
+
+    This node is created by AttributeNode.analyse_as_ordinary_attribute_node
+    when the object type is_nullable_value, so that the normal value-class
+    attribute machinery can proceed against the inner value type.
+    """
+    subexprs = ['obj']
+    skip_none_check = False
+    # name of the attribute being accessed (for the AttributeError message)
+    attribute_name = ''
+
+    def __init__(self, pos, obj, attribute_name=''):
+        super().__init__(pos)
+        assert getattr(obj.type, 'is_nullable_value', False)
+        self.obj = obj
+        self.type = obj.type.value_type   # CValueClassType
+        self.attribute_name = attribute_name
+        # By default we need to emit a guard; it's a temp because
+        # generate_result_code may raise.
+        self.is_temp = 0  # value struct: no temp needed, direct access
+
+    def analyse_types(self, env):
+        return self
+
+    def may_be_none(self):
+        return False  # after our guard, it's definitely non-None
+
+    def is_addressable(self):
+        return False
+
+    def calculate_result_code(self):
+        return "%s.%s" % (self.obj.result(), Naming.value_member_cname)
+
+    def generate_result_code(self, code):
+        if not self.skip_none_check:
+            # Emit: if (unlikely(obj.__pyx_is_none)) { PyErr_Format(...); goto error; }
+            isnone = "%s.%s" % (self.obj.result(), Naming.nullable_value_isnone_cname)
+            attr = self.attribute_name or '?'
+            from .StringEncoding import escape_byte_string
+            escaped_attr = escape_byte_string(attr.encode('UTF-8'))
+            code.putln("if (unlikely(%s)) {" % isnone)
+            code.putln(
+                'PyErr_Format(PyExc_AttributeError, '
+                '"\'NoneType\' object has no attribute \'%%.200s\'", "%s");'
+                % escaped_attr)
+            code.putln(code.error_goto(self.pos))
+            code.putln("}")
+
+
+class NullableValueUnwrapNode(CoercionNode):
+    """
+    Coerce a CNullableValueType to its inner CValueClassType.
+
+    Yields ``arg.__pyx_value`` of type ``value_type`` (the inner CValueClassType).
+    Unless ``skip_none_check`` is True, emits a runtime ``__pyx_is_none`` guard
+    that raises TypeError before reading the value.
+
+    Created by ExprNode.coerce_to when the source type is_nullable_value and
+    the destination type is the same nullable's inner value_type.
+    """
+    subexprs = ['arg']
+    skip_none_check = False
+    is_temp = 0  # direct struct member access, no temp needed
+
+    def __init__(self, arg, dst_type):
+        assert getattr(arg.type, 'is_nullable_value', False)
+        assert getattr(dst_type, 'is_value_class', False)
+        CoercionNode.__init__(self, arg)
+        self.type = dst_type
+
+    def analyse_types(self, env):
+        return self
+
+    def may_be_none(self):
+        return False  # after our guard, definitely non-None
+
+    def is_addressable(self):
+        return False
+
+    def calculate_result_code(self):
+        return "%s.%s" % (self.arg.result(), Naming.value_member_cname)
+
+    def generate_result_code(self, code):
+        if not self.skip_none_check:
+            isnone = "%s.%s" % (self.arg.result(), Naming.nullable_value_isnone_cname)
+            code.putln("if (unlikely(%s)) {" % isnone)
+            code.putln(
+                'PyErr_SetString(PyExc_TypeError, "expected \'%s\', got None");'
+                % self.type)
+            code.putln(code.error_goto(self.pos))
+            code.putln("}")
 
 
 class CastNode(CoercionNode):

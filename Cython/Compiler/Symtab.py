@@ -1442,6 +1442,7 @@ class ModuleScope(Scope):
         self.undeclared_cached_builtins = []
         self.namespace_cname = self.module_cname
         self._cached_tuple_types = {}
+        self._cached_nullable_value_types = {}
         self._cached_defaults_c_class_entries = {}
         # Get compilation_sources from context for LTO
         self.compilation_sources = context.compilation_sources if context else None
@@ -1484,6 +1485,37 @@ class ModuleScope(Scope):
             ttype.struct_entry = struct_entry
             entry = self.declare_type(cname, ttype, pos, cname)
         ttype.entry = entry
+        return entry
+
+    def declare_nullable_value_type(self, pos, value_type):
+        """Declare (or retrieve from cache) a CNullableValueType wrapping value_type."""
+        cache_key = value_type.cname
+        try:
+            return self._cached_nullable_value_types[cache_key]
+        except KeyError:
+            pass
+
+        cname = Naming.nullable_value_struct_prefix + value_type.cname
+        ntype = PyrexTypes.CNullableValueType(value_type, cname)
+        self._cached_nullable_value_types[cache_key] = None  # placeholder to avoid re-entry
+
+        entry = self.lookup_here(cname)
+        if not entry:
+            scope = StructOrUnionScope(cname)
+            scope.declare_var(
+                name="is_none", type=PyrexTypes.c_bint_type, pos=pos,
+                cname=Naming.nullable_value_isnone_cname)
+            scope.declare_var(
+                name="value", type=value_type, pos=pos,
+                cname=Naming.value_member_cname, allow_refcounted=True)
+            struct_entry = self.declare_struct_or_union(
+                cname + '_struct', 'struct', scope, typedef_flag=True, pos=pos, cname=cname)
+            self.type_entries.remove(struct_entry)
+            ntype.struct_entry = struct_entry
+            ntype.scope = scope
+            entry = self.declare_type(cname, ntype, pos, cname)
+        ntype.entry = entry
+        self._cached_nullable_value_types[cache_key] = entry
         return entry
 
     def declare_defaults_c_class(self, pos, components):
