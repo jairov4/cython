@@ -616,6 +616,10 @@ def func_in_a():
     assert ov2 is None
     ov2 = make_opt_vec_typed(True)
     assert ov2 is not None and ov2.y == 4
+    r: int | Vec2 | None = ov2
+    assert isinstance(r, Vec2) and r.x == 3 and r.y == 4
+    r = 23
+    assert r == 23
 
     return func_in_b()
 
