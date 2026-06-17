@@ -5395,7 +5395,7 @@ class NullableValueNarrowingTransform(CythonTransform):
             inner = condition.arg
             while isinstance(inner, CoerceToTempNode):
                 inner = inner.arg
-            if isinstance(inner, NameNode) and getattr(inner.type, 'is_nullable_value', False):
+            if isinstance(inner, NameNode) and inner.type.is_nullable_value:
                 return inner.entry
         if not isinstance(condition, PrimaryCmpNode):
             return None
@@ -5404,7 +5404,7 @@ class NullableValueNarrowingTransform(CythonTransform):
         if condition.operator not in ('is_not', '!='):
             return None
         operand = (condition.operand1
-                   if getattr(condition.operand1.type, 'is_nullable_value', False)
+                   if condition.operand1.type.is_nullable_value
                    else condition.operand2)
         if not isinstance(operand, NameNode):
             return None

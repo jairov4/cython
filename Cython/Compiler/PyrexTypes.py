@@ -5215,7 +5215,7 @@ class CValueClassType(CStructOrUnionType):
         # Cross-module cimport_from_pyx creates separate CValueClassType objects
         # for the same type; compare by cname so assignability works correctly.
         return (other_type is error_type or
-                (getattr(other_type, 'is_value_class', False)
+                (other_type.is_value_class
                  and self.cname == other_type.cname))
 
     # --- Refcounting interface (mirrors MemoryViewSliceType) ---------------
@@ -5345,7 +5345,7 @@ class CNullableValueType(CType):
     def same_as_resolved_type(self, other_type):
         # Cross-module cimport_from_pyx may create separate objects; compare by cname.
         return (other_type is error_type or
-                (getattr(other_type, 'is_nullable_value', False)
+                (other_type.is_nullable_value
                  and self.cname == other_type.cname))
 
     def cast_code(self, expr_code):
@@ -5404,7 +5404,7 @@ class CNullableValueType(CType):
 
 def nullable_value_type_for(env, pos, inner):
     """If `inner` is a value class, return its nullable wrapper type; else None."""
-    if inner is not None and getattr(inner, 'is_value_class', False):
+    if inner is not None and inner.is_value_class:
         return env.global_scope().declare_nullable_value_type(pos, inner).type
     return None
 
@@ -6222,10 +6222,10 @@ def spanning_type(type1, type2):
 
 def _spanning_type(type1, type2):
     # Nullable value type + its inner value type → nullable (either order).
-    if getattr(type1, 'is_nullable_value', False) and getattr(type2, 'is_value_class', False):
+    if type1.is_nullable_value and type2.is_value_class:
         if type1.value_type.same_as(type2):
             return type1
-    if getattr(type2, 'is_nullable_value', False) and getattr(type1, 'is_value_class', False):
+    if type2.is_nullable_value and type1.is_value_class:
         if type2.value_type.same_as(type1):
             return type2
     if type1.is_numeric and type2.is_numeric:

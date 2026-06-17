@@ -931,7 +931,7 @@ class ExprNode(Node):
             elif self.type.is_memoryviewslice:
                 code.putln("%s.memview = NULL;" % self.result())
                 code.putln("%s.data = NULL;" % self.result())
-            elif self.type.is_value_class and self.type.needs_refcounting:
+            elif (self.type.is_value_class or self.type.is_nullable_value) and self.type.needs_refcounting:
                 # Clear all fields to NULL so the subsequent disposal is a no-op
                 # (mirrors 'cname = 0' for pyobject after a value has been moved out).
                 code.putln("memset(&%s, 0, sizeof(%s));" % (
@@ -1089,25 +1089,25 @@ class ExprNode(Node):
                     error(self.pos, msg % tup)
 
         elif (src_type.is_ptr and not dst_type.is_ptr
-                and getattr(src_type.base_type, 'is_value_class', False)):
+                and src_type.base_type.is_value_class):
             # Pointer-to-value-class (`self` inside a value_type method) used where
             # the value itself or a Python object is expected: auto-dereference.
             deref = DereferenceNode(src.pos, operand=src)
             deref = deref.analyse_types(env)
             src = deref.coerce_to(dst_type, env)
 
-        elif getattr(dst_type, 'is_nullable_value', False):
+        elif dst_type.is_nullable_value:
             if getattr(src_type, 'is_error', False):
                 # Propagate earlier errors without crashing.
                 pass
             elif src.is_none:
                 # None -> nullable: set is_none=1, zero value payload
                 src = NullableValueCoercionNode(src, dst_type, is_none=True)
-            elif (getattr(src.type, 'is_nullable_value', False)
+            elif (src.type.is_nullable_value
                   and src.type.same_as(dst_type)):
                 # Same nullable type: no-op
                 pass
-            elif (getattr(src.type, 'is_value_class', False)
+            elif (src.type.is_value_class
                   and src.type.same_as(dst_type.value_type)):
                 # Inner value class -> wrap in nullable struct with is_none=0
                 src = NullableValueCoercionNode(src, dst_type, is_none=False)
@@ -1117,10 +1117,10 @@ class ExprNode(Node):
             else:
                 self.fail_assignment(dst_type)
 
-        elif (getattr(src_type, 'is_nullable_value', False)
+        elif (src_type.is_nullable_value
               and not getattr(src_type, 'is_error', False)
               and not getattr(dst_type, 'is_error', False)
-              and getattr(dst_type, 'is_value_class', False)
+              and dst_type.is_value_class
               and src_type.value_type.same_as(dst_type)):
             # Nullable value type -> inner value type: unwrap with None guard.
             src = NullableValueUnwrapNode(src, dst_type)
@@ -1248,7 +1248,7 @@ class ExprNode(Node):
                     args=[]).analyse_types(env)
             # No __bool__: box and use Python truth-testing.
             return self.coerce_to_pyobject(env).coerce_to_boolean(env)
-        elif getattr(type, 'is_nullable_value', False):
+        elif type.is_nullable_value:
             # bool(opt) = !opt.is_none && <inner truthiness>
             # Check if the inner value class defines __bool__ via the boxed type's scope.
             inner_type = type.value_type
@@ -1448,7 +1448,7 @@ class NoneNode(PyConstNode):
 
     def coerce_to(self, dst_type, env):
         if not (dst_type.is_pyobject or dst_type.is_memoryviewslice or dst_type.is_error
-                or getattr(dst_type, 'is_nullable_value', False)):
+                or dst_type.is_nullable_value):
             # Catch this error early and loudly.
             error(self.pos, "Cannot assign None to %s" % dst_type)
         return super().coerce_to(dst_type, env)
@@ -2845,10 +2845,11 @@ class NameNode(AtomicExprNode):
             if self.type.is_const:
                 # Const variables are assigned when declared
                 assigned = True
-            if (self.type.is_value_class
+            if ((self.type.is_value_class or self.type.is_nullable_value)
                     and self.type.needs_refcounting
                     and self.use_managed_ref):
-                # Refcounted value class: mirror the pyobject owned-reference path.
+                # Refcounted value class or nullable value type: mirror the pyobject
+                # owned-reference path.
                 # INCREF the rhs fields (so both rhs and future lhs own a reference
                 # to each PyObject* field), then copy struct to lhs (and DECREF old
                 # lhs if it was already initialized).
@@ -6936,7 +6937,7 @@ class SimpleCallNode(CallNode):
                         format_args=[entry.name, formal_arg.type.name])
             if self.self:
                 if (formal_arg.type.is_ptr
-                        and getattr(formal_arg.type.base_type, 'is_value_class', False)):
+                        and formal_arg.type.base_type.is_value_class):
                     # value_type method: formal self is __pyx_val_T *.  Build the
                     # pointer from the actual self expression:
                     #  - value struct (lvalue/temp) -> &v
@@ -6972,7 +6973,7 @@ class SimpleCallNode(CallNode):
             # value pointer (&obj->__pyx_value or &v) rather than a plain cast.
             if (i == 0 and self.self is None
                     and formal_type.is_ptr
-                    and getattr(formal_type.base_type, 'is_value_class', False)
+                    and formal_type.base_type.is_value_class
                     and not (getattr(args[i].type, 'is_ptr', False)
                              and args[i].type.base_type is formal_type.base_type)):
                 args[i] = self._coerce_value_self(args[i], formal_type, env)
@@ -8477,7 +8478,7 @@ class AttributeNode(ExprNode):
         obj_type = self.obj.infer_type(env)
         if obj_type is None:
             return py_object_type
-        if getattr(obj_type, 'is_nullable_value', False):
+        if obj_type.is_nullable_value:
             # For inference: look up the attribute against the inner value type
             # (the actual rewrite happens in analyse_as_ordinary_attribute_node).
             obj_type = obj_type.value_type
@@ -8610,7 +8611,7 @@ class AttributeNode(ExprNode):
                 ctype = copy.copy(entry.type)
                 ctype.args = ctype.args[:]
             elif (entry.type.args and entry.type.args[0].type.is_ptr
-                    and getattr(entry.type.args[0].type.base_type, 'is_value_class', False)):
+                    and entry.type.args[0].type.base_type.is_value_class):
                 # value_type method: keep the value-pointer self ABI (__pyx_val_T *);
                 # the unbound call coerces the boxed/value actual self into that ptr.
                 ctype = entry.type
@@ -8724,7 +8725,7 @@ class AttributeNode(ExprNode):
                 self.type = py_object_type
                 self.is_temp = 1
                 return self
-        if getattr(self.obj.type, 'is_nullable_value', False):
+        if self.obj.type.is_nullable_value:
             # Unwrap the nullable value to its inner value type, emitting an
             # is-None guard unless the object is proven non-None by control flow.
             if target:
@@ -8976,7 +8977,7 @@ class AttributeNode(ExprNode):
             # boxed type via the value-class fallback) is always final by
             # construction -> direct call through final_func_cname.
             if (obj.type.is_value_class
-                    or (obj.type.is_ptr and getattr(obj.type.base_type, 'is_value_class', False))):
+                    or (obj.type.is_ptr and obj.type.base_type.is_value_class)):
                 if self.entry.final_func_cname:
                     return self.entry.final_func_cname
             if obj.type.is_extension_type and not self.entry.is_builtin_cmethod:
@@ -13374,7 +13375,7 @@ def _value_class_of(t):
         return None
     if t.is_value_class:
         return t
-    if t.is_ptr and getattr(t.base_type, 'is_value_class', False):
+    if t.is_ptr and t.base_type.is_value_class:
         return t.base_type
     return None
 
@@ -13417,7 +13418,7 @@ def _lookup_cpdef_dunder(type1, dunder_name, operand2_type=None):
         if entry is not None and entry.type.args:
             self_arg_type = entry.type.args[0].type
             if (self_arg_type.is_ptr
-                    and getattr(self_arg_type.base_type, 'is_value_class', False)):
+                    and self_arg_type.base_type.is_value_class):
                 return entry
         return None
     if not type1.is_extension_type:
@@ -14828,7 +14829,7 @@ class BoolBinopNode(ExprNode):
                     self.operand1.py_result(),
                     code.error_goto_if_neg(test_result, self.pos)))
             return (test_result, True)
-        elif getattr(self.type, 'is_nullable_value', False):
+        elif self.type.is_nullable_value:
             # Nullable struct: truth = !is_none.
             test_result = code.funcstate.allocate_temp(
                 PyrexTypes.c_bint_type, manage_ref=False)
@@ -14895,7 +14896,7 @@ class BoolBinopResultNode(ExprNode):
                     self.arg.py_result(),
                     code.error_goto_if_neg(test_result, self.pos)))
             return (test_result, True)
-        elif getattr(self.arg.type, 'is_nullable_value', False):
+        elif self.arg.type.is_nullable_value:
             # Nullable struct: truth = !is_none (no inner __bool__ needed for short-circuit).
             test_result = code.funcstate.allocate_temp(
                 PyrexTypes.c_bint_type, manage_ref=False)
@@ -15010,13 +15011,13 @@ class CondExprNode(ExprNode):
         # struct), but expressions like `-self` return T (struct by value).
         # Auto-deref the pointer branch so both branches have the same value type.
         if (true_val_type.is_ptr
-                and getattr(true_val_type.base_type, 'is_value_class', False)
+                and true_val_type.base_type.is_value_class
                 and true_val_type.base_type.same_as(false_val_type)):
             deref = DereferenceNode(self.true_val.pos, operand=self.true_val)
             self.true_val = deref.analyse_types(env)
             true_val_type = self.true_val.type
         elif (false_val_type.is_ptr
-                and getattr(false_val_type.base_type, 'is_value_class', False)
+                and false_val_type.base_type.is_value_class
                 and false_val_type.base_type.same_as(true_val_type)):
             deref = DereferenceNode(self.false_val.pos, operand=self.false_val)
             self.false_val = deref.analyse_types(env)
@@ -15038,7 +15039,7 @@ class CondExprNode(ExprNode):
                 self.true_val = self.true_val.coerce_to(self.type, env)
             if false_val_type != self.type:
                 self.false_val = self.false_val.coerce_to(self.type, env)
-        elif getattr(self.type, 'is_nullable_value', False):
+        elif self.type.is_nullable_value:
             # Nullable value type spanning: coerce each branch to the nullable type
             # (e.g. Vec2 -> Vec2|None wraps; same nullable passes through).
             if true_val_type != self.type:
@@ -15811,8 +15812,8 @@ class PrimaryCmpNode(ExprNode, CmpNode):
         have_none = self.operand1.is_none or self.operand2.is_none
         t1 = self.operand1.type
         t2 = self.operand2.type
-        is_nullable1 = getattr(t1, 'is_nullable_value', False)
-        is_nullable2 = getattr(t2, 'is_nullable_value', False)
+        is_nullable1 = t1.is_nullable_value
+        is_nullable2 = t2.is_nullable_value
         have_nullable = is_nullable1 or is_nullable2
         if not have_nullable:
             return False
@@ -15836,8 +15837,8 @@ class PrimaryCmpNode(ExprNode, CmpNode):
             return False
 
         # Determine the inner CValueClassType for each nullable operand.
-        inner1 = getattr(t1, 'value_type', None) if is_nullable1 else (t1 if getattr(t1, 'is_value_class', False) else None)
-        inner2 = getattr(t2, 'value_type', None) if is_nullable2 else (t2 if getattr(t2, 'is_value_class', False) else None)
+        inner1 = getattr(t1, 'value_type', None) if is_nullable1 else (t1 if t1.is_value_class else None)
+        inner2 = getattr(t2, 'value_type', None) if is_nullable2 else (t2 if t2.is_value_class else None)
 
         # We require at least one nullable and the other to be the *same* inner
         # value class (or nullable wrapping the same inner value class), to avoid
@@ -15931,7 +15932,7 @@ class PrimaryCmpNode(ExprNode, CmpNode):
                     # Lower `opt is/== None` to a direct .is_none field check.
                     # c_operator already maps 'is'->'==' and 'is_not'->'!='.
                     c_op = self.c_operator(self.operator)
-                    if getattr(operand1.type, 'is_nullable_value', False):
+                    if operand1.type.is_nullable_value:
                         return "(%s.%s %s 1)" % (result1, Naming.nullable_value_isnone_cname, c_op)
                     else:
                         return "(%s.%s %s 1)" % (result2, Naming.nullable_value_isnone_cname, c_op)
@@ -16181,7 +16182,7 @@ class NullableValueCoercionNode(CoercionNode):
     is_none_value = False
 
     def __init__(self, arg, dst_type, is_none):
-        assert getattr(dst_type, 'is_nullable_value', False)
+        assert dst_type.is_nullable_value
         CoercionNode.__init__(self, arg)
         self.type = dst_type
         self.is_none_value = is_none
@@ -16206,13 +16207,19 @@ class NullableValueCoercionNode(CoercionNode):
             # Value branch: mark is_none=0, copy inner value
             code.putln("%s.%s = 0;" % (self.result(), Naming.nullable_value_isnone_cname))
             inner_type = self.type.value_type
-            if self.type.needs_refcounting:
-                # Take ownership: make_owned_reference increments if needed
-                self.arg.make_owned_reference(code)
             code.putln("%s.%s = %s;" % (
                 self.result(),
                 Naming.value_member_cname,
                 self.arg.result_as(inner_type)))
+            if self.type.needs_refcounting:
+                # The struct copy is a raw bit copy that does not adjust refcounts.
+                # INCREF the destination so it owns independent references to any
+                # PyObject* fields.  (The source temp will be XDECREF'd by the normal
+                # temp-disposal path once this result node is consumed.)
+                incref = inner_type.get_incref_code(
+                    "%s.%s" % (self.result(), Naming.value_member_cname))
+                if incref:
+                    code.putln(incref)
 
 class NullableValueBoolNode(CoercionNode):
     """
@@ -16287,7 +16294,7 @@ class NullableValueMemberNode(ExprNode):
 
     def __init__(self, pos, obj, attribute_name=''):
         super().__init__(pos)
-        assert getattr(obj.type, 'is_nullable_value', False)
+        assert obj.type.is_nullable_value
         self.obj = obj
         self.type = obj.type.value_type   # CValueClassType
         self.attribute_name = attribute_name
@@ -16339,8 +16346,8 @@ class NullableValueUnwrapNode(CoercionNode):
     is_temp = 0  # direct struct member access, no temp needed
 
     def __init__(self, arg, dst_type):
-        assert getattr(arg.type, 'is_nullable_value', False)
-        assert getattr(dst_type, 'is_value_class', False)
+        assert arg.type.is_nullable_value
+        assert dst_type.is_value_class
         CoercionNode.__init__(self, arg)
         self.type = dst_type
 

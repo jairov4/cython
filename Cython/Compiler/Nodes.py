@@ -2980,7 +2980,7 @@ class CFuncDefNode(FuncDefNode):
             # must NOT disable cpdef/overridable (the class is final, so the
             # Python wrapper passes &obj->__pyx_value to the same C function).
             is_value_self = (arg0_type is not None and arg0_type.is_ptr
-                             and getattr(arg0_type.base_type, 'is_value_class', False))
+                             and arg0_type.base_type.is_value_class)
             if len(self.args) < 1 or (not arg0_type.is_pyobject and not is_value_self):
                 # An error will be produced in the cdef function
                 self.overridable = False
@@ -3084,7 +3084,7 @@ class CFuncDefNode(FuncDefNode):
             cfunc = ExprNodes.AttributeNode(self.pos, obj=class_node, attribute=self.entry.name)
         else:
             self_type = self.type.args[0].type
-            if self_type.is_ptr and getattr(self_type.base_type, 'is_value_class', False):
+            if self_type.is_ptr and self_type.base_type.is_value_class:
                 # value_type method: the C self is __pyx_val_T *, but the Python
                 # wrapper's self is the boxed ext type.  Use the boxed type's entry
                 # for the attribute lookup; DefNodeWrapper.generate_function_body
@@ -4120,7 +4120,7 @@ class DefNode(FuncDefNode):
             arg.needs_type_test = 0
             arg.is_generic = 1
             if arg.type.is_pyobject or arg.type.is_buffer or arg.type.is_memoryviewslice or \
-                    getattr(arg.type, 'is_nullable_value', False):
+                    arg.type.is_nullable_value:
                 if arg.or_none:
                     arg.accept_none = True
                 elif arg.not_none:
@@ -6910,7 +6910,7 @@ class CClassDefNode(ClassDefNode):
                 ftype = entry.type
                 if ftype.is_ctuple or ftype.is_struct_or_union:
                     dep_types.add(ftype)
-                elif getattr(ftype, 'is_nullable_value', False):
+                elif ftype.is_nullable_value:
                     # Optional[InnerValueType] fields: the __pyx_optval_Inner entry
                     # must be emitted before this value struct.  The nullable entry is
                     # added to type_entries during body analysis (after _build_value_
@@ -8449,7 +8449,7 @@ class DelStatNode(StatNode):
             arg = self.args[i] = arg.analyse_target_expression(env, None)
             if (arg.type.is_pyobject
                     or (arg.is_name and arg.type.is_memoryviewslice)
-                    or (arg.is_name and getattr(arg.type, 'is_value_class', False)
+                    or (arg.is_name and arg.type.is_value_class
                         and arg.type.needs_refcounting)):
                 if arg.is_name and arg.entry.is_cglobal:
                     error(arg.pos, "Deletion of global C variable")
@@ -8477,7 +8477,7 @@ class DelStatNode(StatNode):
             if (arg.type.is_pyobject or
                     arg.type.is_memoryviewslice or
                     arg.is_subscript and arg.base.type.is_pybytearray_type or
-                    (arg.is_name and getattr(arg.type, 'is_value_class', False)
+                    (arg.is_name and arg.type.is_value_class
                      and arg.type.needs_refcounting)):
                 arg.generate_deletion_code(
                     code, ignore_nonexisting=self.ignore_nonexisting)
@@ -8593,7 +8593,7 @@ class ReturnStatNode(StatNode):
                 # __pyx_val_T *) -- dereference to the value struct, so it returns by
                 # value or boxes (*self) when crossing to a Python object context.
                 if (self.value.type.is_ptr
-                        and getattr(self.value.type.base_type, 'is_value_class', False)
+                        and self.value.type.base_type.is_value_class
                         and (return_type.is_pyobject
                              or return_type is self.value.type.base_type)):
                     from .ExprNodes import DereferenceNode

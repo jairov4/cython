@@ -715,8 +715,8 @@ def generate_cmp_code(code, op, funcname, node, fields, *, critical_section_plac
                 # generated comparison code is C).  Box both sides via <object> cast so
                 # Python-level richcmp is used, dispatching to the nested type's dunders.
                 field_entry = node.scope.lookup(name)
-                if field_entry and (getattr(field_entry.type, 'is_value_class', False)
-                                    or getattr(field_entry.type, 'is_nullable_value', False)):
+                if field_entry and (field_entry.type.is_value_class
+                                    or field_entry.type.is_nullable_value):
                     self_expr = f"<object>self.{name}"
                     other_expr = f"<object>other_cast.{name}"
                 else:

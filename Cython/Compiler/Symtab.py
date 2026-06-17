@@ -1141,7 +1141,7 @@ class Scope:
             etype = entry.type
             if (etype.is_extension_type
                     and getattr(etype, 'equivalent_type', None) is not None
-                    and getattr(etype.equivalent_type, 'is_value_class', False)):
+                    and etype.equivalent_type.is_value_class):
                 return etype.equivalent_type
             return entry.type
 
@@ -2636,6 +2636,13 @@ class CClassScope(ClassScope):
                 if (not type.is_builtin_type
                         or not type.scope or type.scope.needs_gc()):
                     self.has_cyclic_pyobject_attrs = True
+            elif (type.is_value_class or type.is_nullable_value) and type.needs_refcounting:
+                # A value_type (or nullable value_type) field embeds PyObject
+                # references inside its struct.  The scope must participate in GC
+                # so tp_traverse/tp_clear visit those embedded objects; otherwise
+                # the GC can free them prematurely (use-after-free).
+                self.has_pyobject_attrs = True
+                self.has_cyclic_pyobject_attrs = True
             if visibility not in ('private', 'public', 'readonly'):
                 error(pos,
                     "Attribute of extension type cannot be declared %s" % visibility)

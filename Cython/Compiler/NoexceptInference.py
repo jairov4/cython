@@ -482,7 +482,7 @@ class _BodyRaiseAnalysis(TreeVisitor):
         # the value-class struct: pure member stores (no allocation, no
         # __init__ dispatch), so it cannot raise iff every value is safe.  A
         # Python-dict result allocates (PyDict_New can raise) and stays unsafe.
-        if not getattr(node.type, 'is_value_class', False):
+        if not node.type.is_value_class:
             return False
         for item in node.key_value_pairs:
             if not self._node_safe(item.value):

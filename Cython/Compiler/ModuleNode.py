@@ -855,7 +855,7 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                     if entry.name not in ctuple_names:
                         ctuple_names.add(entry.name)
                         type_entries.append(entry)
-                elif getattr(entry.type, 'is_nullable_value', False):
+                elif entry.type.is_nullable_value:
                     if entry.type.cname not in nullable_names:
                         nullable_names.add(entry.type.cname)
                         type_entries.append(entry)
@@ -1135,7 +1135,7 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                     self.generate_struct_union_predeclaration(entry, code)
                 elif type.is_ctuple and not type.is_fused and entry.used:
                     self.generate_struct_union_predeclaration(entry.type.struct_entry, code)
-                elif getattr(type, 'is_nullable_value', False):
+                elif type.is_nullable_value:
                     self.generate_struct_union_predeclaration(type.struct_entry, code)
                 elif type.is_extension_type:
                     self.generate_objstruct_predeclaration(type, code)
@@ -1152,7 +1152,7 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                     self.generate_struct_union_definition(entry, code)
                 elif type.is_ctuple and not type.is_fused and entry.used:
                     self.generate_struct_union_definition(entry.type.struct_entry, code)
-                elif getattr(type, 'is_nullable_value', False):
+                elif type.is_nullable_value:
                     self._generate_nullable_struct_definition(type, code)
                 elif type.is_cpp_class:
                     self.generate_cpp_class_definition(entry, code)
@@ -1232,7 +1232,7 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             for attr in var_entries:
                 code.putln(
                     "%s;" % attr.type.declaration_code(attr.cname))
-            if getattr(type, 'is_value_class', False) and var_entries:
+            if type.is_value_class and var_entries:
                 # C++ doesn't auto-generate comparison operators for structs.
                 # Value types with frozen-dataclass __eq__ need these for
                 # C-level comparisons like `if self.field != value:`.
@@ -1546,14 +1546,14 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         """Return the CValueClassType for a value_type c_class entry, else None."""
         ext_type = entry.type
         value_type = getattr(ext_type, 'equivalent_type', None)
-        if value_type is not None and getattr(value_type, 'is_value_class', False):
+        if value_type is not None and value_type.is_value_class:
             return value_type
         return None
 
     @staticmethod
     def _is_refcounted_value_member(t):
         """True for value-class or nullable-value fields that carry refcounted content."""
-        return (getattr(t, 'is_value_class', False) or getattr(t, 'is_nullable_value', False)) \
+        return (t.is_value_class or t.is_nullable_value) \
                and t.needs_refcounting
 
     def generate_value_class_converter_protos(self, entry, code, env=None):
@@ -1581,7 +1581,7 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         for module in self.referenced_modules:
             for entry in module.type_entries:
                 t = entry.type
-                if getattr(t, 'is_nullable_value', False) and t.cname not in result:
+                if t.is_nullable_value and t.cname not in result:
                     result[t.cname] = t
         return result
 
@@ -1758,9 +1758,9 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             ftype = f.type
             if ftype.is_pyobject:
                 code.putln("Py_XINCREF(v->%s);" % f.cname)
-            elif getattr(ftype, 'is_value_class', False) and ftype.needs_refcounting:
+            elif ftype.is_value_class and ftype.needs_refcounting:
                 code.putln("%s(&v->%s);" % (ftype._refcount_incref_fname, f.cname))
-            elif getattr(ftype, 'is_nullable_value', False) and ftype.needs_refcounting:
+            elif ftype.is_nullable_value and ftype.needs_refcounting:
                 code.putln("%s(&v->%s);" % (ftype._refcount_incref_fname, f.cname))
             elif ftype.is_memoryviewslice:
                 code.putln("__PYX_INC_MEMVIEW(&v->%s, 1);" % f.cname)
@@ -1773,9 +1773,9 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             ftype = f.type
             if ftype.is_pyobject:
                 code.putln("Py_XDECREF(v->%s);" % f.cname)
-            elif getattr(ftype, 'is_value_class', False) and ftype.needs_refcounting:
+            elif ftype.is_value_class and ftype.needs_refcounting:
                 code.putln("%s(&v->%s);" % (ftype._refcount_decref_fname, f.cname))
-            elif getattr(ftype, 'is_nullable_value', False) and ftype.needs_refcounting:
+            elif ftype.is_nullable_value and ftype.needs_refcounting:
                 code.putln("%s(&v->%s);" % (ftype._refcount_decref_fname, f.cname))
             elif ftype.is_memoryviewslice:
                 code.putln("__PYX_XCLEAR_MEMVIEW(&v->%s, 1);" % f.cname)
@@ -1810,7 +1810,7 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                     type.vtabstruct_cname,
                     type.vtabslot_cname))
         value_type = getattr(type, 'equivalent_type', None)
-        if value_type is not None and getattr(value_type, 'is_value_class', False):
+        if value_type is not None and value_type.is_value_class:
             # value_type class: embed the value struct as a single member instead
             # of laying out each field separately (the field entries' cnames have
             # been rewritten to '__pyx_value.<field>').
@@ -2524,7 +2524,7 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             elif field.type.is_value_class and field.type.needs_refcounting:
                 self._generate_value_class_traverse_fields(
                     "%s.%s" % (prefix, field.cname), field.type, code)
-            elif getattr(field.type, 'is_nullable_value', False) and field.type.needs_refcounting:
+            elif field.type.is_nullable_value and field.type.needs_refcounting:
                 # Traverse the inner value only when not-None.
                 field_prefix = "%s.%s" % (prefix, field.cname)
                 isnone = Naming.nullable_value_isnone_cname
@@ -2556,7 +2556,7 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
 
         code.start_slotfunc(scope, PyrexTypes.c_returncode_type, "tp_clear", f"{unused}PyObject *o")
 
-        if py_attrs and Options.clear_to_none:
+        if (py_attrs or refcounted_value_attrs) and Options.clear_to_none:
             code.putln("PyObject* tmp;")
 
         if py_attrs or py_buffers or refcounted_value_attrs:
@@ -2623,11 +2623,17 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
     def _generate_value_class_clear_fields(self, prefix, vtype, code):
         for field in vtype.scope.var_entries:
             if field.type.is_pyobject:
-                code.putln("Py_CLEAR(%s.%s);" % (prefix, field.cname))
+                field_cname = "%s.%s" % (prefix, field.cname)
+                if Options.clear_to_none:
+                    code.putln("tmp = ((PyObject*)%s);" % field_cname)
+                    code.put_init_to_py_none(field_cname, field.type, nanny=False)
+                    code.putln("Py_XDECREF(tmp);")
+                else:
+                    code.putln("Py_CLEAR(%s);" % field_cname)
             elif field.type.is_value_class and field.type.needs_refcounting:
                 self._generate_value_class_clear_fields(
                     "%s.%s" % (prefix, field.cname), field.type, code)
-            elif getattr(field.type, 'is_nullable_value', False) and field.type.needs_refcounting:
+            elif field.type.is_nullable_value and field.type.needs_refcounting:
                 # Clear the inner value only when not-None.
                 field_prefix = "%s.%s" % (prefix, field.cname)
                 isnone = Naming.nullable_value_isnone_cname
