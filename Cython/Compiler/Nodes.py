@@ -6830,8 +6830,15 @@ class CClassDefNode(ClassDefNode):
         """
         from .Symtab import Entry
         ext_type = self.entry.type
-        if getattr(ext_type, 'equivalent_type', None) is not None:
-            return  # already built (defensive: only build once)
+        existing = getattr(ext_type, 'equivalent_type', None)
+        if existing is not None:
+            # Shell was pre-built by ForwardDeclareTypes; correct defined_in_pxd
+            # since SetInPxdTransform runs after ForwardDeclareTypes but before
+            # analyse_declarations.
+            ext_val_entry = getattr(existing, 'entry', None)
+            if ext_val_entry is not None and ext_val_entry.defined_in_pxd != self.in_pxd:
+                ext_val_entry.defined_in_pxd = self.in_pxd
+            return
 
         class_name = self.class_name
         value_cname = home_scope.mangle(Naming.value_struct_prefix, class_name)
@@ -6866,6 +6873,55 @@ class CClassDefNode(ClassDefNode):
         # Name-resolution hooks: the class name in a TYPE context resolves to the
         # value type; boxing/unboxing goes through the ext type.
         ext_type.equivalent_type = value_type
+
+        # Build shells for all other @value_type classes whose equivalent_type
+        # is not yet set.  ForwardDeclareTypes runs before AnalyseDeclarations,
+        # so every class in the module already has an entry + scope with
+        # directives (including 'value_type') set.  Without this scan, a value
+        # class defined AFTER another (e.g. timedelta after datetime) won't
+        # have its equivalent_type set yet when the earlier class's methods
+        # are analysed -- producing boxed-pointer signatures instead of
+        # value-struct ABI for cross-references like __sub__() -> timedelta.
+        self._build_pending_value_class_shells(home_scope)
+
+    def _build_pending_value_class_shells(self, home_scope):
+        """Build value-struct type shells for @value_type classes whose
+        equivalent_type is not yet set (defined later in the same module).
+        Called once, from the first value-type class's shell build, to ensure
+        cross-references see the value struct, not the boxed extension type.
+        """
+        for ext_entry in home_scope.type_entries:
+            ext_type = ext_entry.type
+            if (ext_type is self.entry.type
+                    or not getattr(ext_type, 'is_extension_type', False)
+                    or getattr(ext_type, 'equivalent_type', None) is not None):
+                continue
+            scope = getattr(ext_type, 'scope', None)
+            if scope is None or not scope.directives.get('value_type'):
+                continue
+            from .Symtab import Entry
+            class_name = ext_entry.name
+            value_cname = home_scope.mangle(Naming.value_struct_prefix, class_name)
+            value_scope = StructOrUnionScope(class_name)
+            value_type = PyrexTypes.CValueClassType(
+                EncodedString(class_name), value_scope, value_cname, ext_type,
+                py_name=class_name)
+            value_entry = Entry(
+                EncodedString(class_name), value_cname, value_type, pos=ext_entry.pos)
+            value_entry.is_type = 1
+            value_entry.visibility = 'private'
+            # ForwardDeclareTypes (before SetInPxdTransform) calls this with
+            # self.in_pxd=False; the correct value is set when the second call
+            # arrives from AnalyseDeclarations (where self.in_pxd is correct).
+            value_entry.defined_in_pxd = self.in_pxd
+            value_entry.scope = home_scope
+            value_type.entry = value_entry
+            try:
+                idx = home_scope.type_entries.index(ext_entry)
+            except ValueError:
+                idx = len(home_scope.type_entries)
+            home_scope.type_entries.insert(idx, value_entry)
+            ext_type.equivalent_type = value_type
 
     def _build_value_class_type(self, home_scope, scope):
         """Stage 2: populate the value struct's data fields (after body analysis).

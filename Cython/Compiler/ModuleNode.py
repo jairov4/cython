@@ -1124,6 +1124,13 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
     def generate_type_header_code(self, type_entries, code):
         # Generate definitions of structs/unions/enums/typedefs/objstructs.
         #self.generate_gcc33_hack(env, code) # Is this still needed?
+        # Collect value-struct types that already have their own entry in
+        # type_entries (defining module), so we don't double-emit them.
+        value_types_in_entries = set()
+        for entry in type_entries:
+            t = entry.type
+            if t.is_value_class:
+                value_types_in_entries.add(t)
         # Forward declarations
         for entry in type_entries:
             if not entry.in_cinclude:
@@ -1139,6 +1146,11 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                     self.generate_struct_union_predeclaration(type.struct_entry, code)
                 elif type.is_extension_type:
                     self.generate_objstruct_predeclaration(type, code)
+                    # Also emit value struct predeclaration if not already in
+                    # type_entries (needed in consumer TUs).
+                    vt = getattr(type, 'equivalent_type', None)
+                    if vt is not None and vt.is_value_class and vt not in value_types_in_entries:
+                        self.generate_struct_union_predeclaration(vt.entry, code)
         # Actual declarations
         for entry in type_entries:
             if not entry.in_cinclude:
@@ -1157,6 +1169,9 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
                 elif type.is_cpp_class:
                     self.generate_cpp_class_definition(entry, code)
                 elif type.is_extension_type:
+                    vt = getattr(type, 'equivalent_type', None)
+                    if vt is not None and vt.is_value_class and vt not in value_types_in_entries:
+                        self.generate_struct_union_definition(vt.entry, code)
                     self.generate_objstruct_definition(type, code)
                 if getattr(type, "scope", None):
                     for var_entry in type.scope.var_entries:
@@ -1540,6 +1555,10 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         if not type.scope:
             return
         code.putln(self.sue_predeclaration(type, "struct", type.objstruct_cname))
+        value_type = getattr(type, 'equivalent_type', None)
+        if value_type is not None and value_type.is_value_class:
+            code.putln(self.sue_predeclaration(
+                value_type, value_type.kind, value_type.cname))
 
     @staticmethod
     def _value_class_type(entry):

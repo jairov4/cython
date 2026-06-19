@@ -6359,6 +6359,20 @@ class CallNode(ExprNode):
                     result_type = Builtin.find_return_type_of_builtin_method(method_obj_type, function.attribute)
                     if result_type is not py_object_type:
                         return result_type
+                # For value-type class methods called on Python-imported extension
+                # types: infer_type may return py_object_type because the object's
+                # entry type was py_object_type (Python import).  Fall back to
+                # looking up the attribute against the object's actual entry type.
+                if function.entry is None:
+                    obj_entry = getattr(function.obj, 'entry', None)
+                    if (obj_entry is not None and obj_entry.type is not py_object_type
+                            and obj_entry.type is not unspecified_type):
+                        scope = obj_entry.type.scope
+                        if scope is not None:
+                            attr_entry = scope.lookup_here(function.attribute)
+                            if (attr_entry is not None and attr_entry.is_cmethod
+                                    and attr_entry.type.is_cfunction):
+                                func_type = attr_entry.type
             entry = getattr(function, 'entry', None)
             if entry is not None:
                 func_type = entry.type or func_type
@@ -6761,6 +6775,23 @@ class SimpleCallNode(CallNode):
         self.analysed = True
         if (as_type_constructor := self.analyse_as_type_constructor(env)) is not None:
             return as_type_constructor
+        # Resolve abs(x) → x.__abs__() during analysis so the optimised return
+        # type propagates to parent nodes (the post-analysis transform
+        # OptimizeBuiltinCalls._handle_simple_function_abs would change the
+        # return type too late, leaving parent node analysis stale).
+        if (getattr(self.function, 'is_name', False)
+                and getattr(self.function, 'name', None) == 'abs'
+                and len(self.args) == 1):
+            arg = self.args[0].analyse_types(env)
+            entry = _lookup_cpdef_dunder(getattr(arg, 'type', None), '__abs__')
+            if entry is not None:
+                call = SimpleCallNode(
+                    self.pos,
+                    function=AttributeNode(self.pos, obj=arg,
+                                           attribute=StringEncoding.EncodedString('__abs__')),
+                    args=[])
+                return call.analyse_types(env)
+            self.args[0] = arg
         self.function.is_called = 1
         self.function = self.function.analyse_types(env)
         function = self.function

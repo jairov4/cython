@@ -2299,6 +2299,17 @@ class ForwardDeclareTypes(CythonTransform):
     def visit_CClassDefNode(self, node):
         if node.class_name not in self.module_scope.entries:
             node.declare(self.module_scope)
+        # Pre-build the value-struct type shell for @value_type classes.
+        # This runs before AnalyseDeclarationsTransform, so it sets
+        # ext_type.equivalent_type for ALL value classes before any class
+        # body analysis runs — ensuring that cross-references among value
+        # classes (e.g. `datetime.__sub__() -> timedelta`) resolve to the
+        # value struct type in for all classes, not just those defined
+        # before the referencing class.
+        if (getattr(node, 'entry', None) and node.entry.type.is_extension_type
+                and self.module_scope.directives.get('value_type')
+                and not getattr(node.entry.type, 'equivalent_type', None)):
+            node._build_value_class_type_shell(self.module_scope, None)
         # Expand fused methods of .pxd declared types to construct the final vtable order.
         type = self.module_scope.entries[node.class_name].type
         if type is not None and type.is_extension_type and not type.is_builtin_type and type.scope:

@@ -98,6 +98,43 @@ follow = m.group(1)
 assert 'PyErr_Occurred' not in follow and '__PYX_ERR' not in follow, \
     "unexpected exception check after noexcept value __add__ call:\n%s" % follow
 
+# --- (7) abs(value).method() — abs resolves to __abs__ value-ABI call, no boxing ---
+ats = function_body(content, '__pyx_f_2vt_abs_and_total_seconds(__pyx_val_2vt_Duration')
+for bad in ('__Pyx_tp_new', 'PyObject_Call', '__Pyx_PyObject_Call'):
+    assert bad not in ats, "unexpected %s in abs_and_total_seconds body" % bad
+# The __abs__ call must be a direct value-ABI call (address of value struct)
+assert re.search(r'pyx_f_2vt_8Duration___abs__\(\(&', ats), \
+    "value-ABI __abs__ call (taking address of value struct) not found in abs_and_total_seconds"
+# The .total_seconds() call on the __abs__ result must also be a direct value-ABI call
+assert re.search(r'pyx_f_2vt_8Duration_total_seconds\(\(&', ats), \
+    "value-ABI total_seconds call (taking address of value struct) not found in abs_and_total_seconds"
+
+# --- (8) Cross-value-type reference: datetime.__sub__ must return __pyx_val_...timedelta ---
+# Search for the datetime.__sub__ function declaration (value-ABI form)
+sub_decl = function_body(content, '___sub__(')
+# The return type must be __pyx_val_ (value struct), not struct __pyx_obj_ (boxed)
+# The function body should be "struct __pyx_obj_" NOT in the return type position
+# Check the proto line for __sub__
+import re
+# Find the function declaration for datetime.__sub__
+for frag in ('__pyx_f_2vt_8datetime___sub__', '8datetime___sub__'):
+    if frag in content:
+        # Find the line containing the declaration
+        for line in lines:
+            if frag in line and '__pyx_f_' in line:
+                # Assert it returns value struct, not boxed pointer
+                assert '__pyx_val_' in line and 'struct __pyx_obj_' not in line, \
+                    "datetime.__sub__ return type should be value struct, got:\n%s" % line
+                break
+
+# --- (9) Cross-value-type reference: sub_to_seconds uses value-ABI for both calls ---
+sub_sec = function_body(content, '__pyx_f_2vt_sub_to_seconds(__pyx_val_2vt_datetime')
+for bad in ('__Pyx_tp_new', 'PyObject_Call', '__Pyx_PyObject_Call'):
+    assert bad not in sub_sec, "unexpected %s in sub_to_seconds body" % bad
+# The __sub__ call must use value-ABI (address of value struct)
+assert re.search(r'pyx_f_2vt_8datetime___sub__\(\(&', sub_sec), \
+    "value-ABI datetime.__sub__ call not found in sub_to_seconds"
+
 print("OK: value_type codegen assertions passed")
 
 ######## run_test.py ########
@@ -108,6 +145,11 @@ import vt
 
 assert vt.make_and_sum(3.0, 4.0) == 7.0, vt.make_and_sum(3.0, 4.0)
 assert vt.add_loop(3) == 9.0, vt.add_loop(3)   # 3*(1+2) = 9
+assert vt.abs_and_total_seconds(vt.Duration(-1_500_000)) == 1.5, vt.abs_and_total_seconds(vt.Duration(-1_500_000))
+assert vt.abs_and_total_seconds(vt.Duration(2_000_000)) == 2.0, vt.abs_and_total_seconds(vt.Duration(2_000_000))
+d1 = vt.datetime(2_000_000)
+d2 = vt.datetime(500_000)
+assert vt.sub_to_seconds(d1, d2) == 1.5, vt.sub_to_seconds(d1, d2)
 print("DONE: value_type runtime tests passed")
 
 ######## vt.pyx ########
@@ -139,3 +181,66 @@ cpdef double add_loop(int n):
     for i in range(n):
         acc = acc + Vec2(1.0, 2.0)
     return acc.x + acc.y
+
+
+# --- Duration value class with __abs__ -> value-ABI + method chain ----------
+
+@cython.value_type
+@cython.final
+@dataclass(frozen=True)
+cdef class Duration:
+    us: cython.longlong
+
+    def __neg__(self) -> Duration:
+        return Duration(-self.us)
+
+    def __abs__(self) -> Duration:
+        if self.us < 0:
+            return -self
+        return self
+
+    def total_seconds(self) -> cython.double:
+        return self.us / 1_000_000.0
+
+
+cpdef double abs_and_total_seconds(Duration d):
+    """abs(d).total_seconds() — no boxing, direct value-ABI calls."""
+    return abs(d).total_seconds()
+
+
+# --- Cross-module-like value-type reference: datetime.__sub__ -> timedelta ---
+# timedelta is defined AFTER datetime, so datetime's auto-promoted cpdef
+# methods must resolve timedelta through the pre-built value shell.
+
+@cython.value_type
+@cython.final
+@dataclass(frozen=True)
+cdef class datetime:
+    us: cython.longlong
+
+    def __add__(self, other: timedelta) -> datetime:
+        return datetime(self.us + other.us)
+
+    def __sub__(self, other: datetime) -> timedelta:
+        return timedelta(self.us - other.us)
+
+
+@cython.value_type
+@cython.final
+@dataclass(frozen=True)
+cdef class timedelta:
+    us: cython.longlong
+
+    def __neg__(self) -> timedelta:
+        return timedelta(-self.us)
+
+    def __abs__(self) -> timedelta:
+        if self.us < 0:
+            return -self
+        return self
+
+
+cpdef double sub_to_seconds(datetime d1, datetime d2):
+    """(d1 - d2).total_seconds() — cross-value-type reference."""
+    cdef timedelta td = d1 - d2
+    return td.us / 1_000_000.0
