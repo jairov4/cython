@@ -7467,8 +7467,19 @@ class PyMethodCallNode(CallNode):
         # Returns the cname of the function variable, temp or name (for VectorcallMethod).
         if self.use_method_vectorcall:
             self.function_obj.generate_evaluation_code(code)
-            code.putln(f"{self_arg} = {self.function_obj.py_result()};")
-            code.put_incref(self_arg, py_object_type)
+            if not self.function_obj.type.is_pyobject:
+                # A C-typed expression (e.g. a value_type result from abs() optimisation
+                # rewriting abs(x) → x.__abs__()) was substituted as the method object
+                # after the outer PyMethodCallNode was already analysed with PyObject*.
+                # Box it into a new reference directly into self_arg.
+                code.putln('%s; %s' % (
+                    self.function_obj.type.to_py_call_code(
+                        self.function_obj.result(), self_arg, py_object_type),
+                    code.error_goto_if_null(self_arg, self.pos)))
+                code.put_gotref(self_arg, py_object_type)
+            else:
+                code.putln(f"{self_arg} = {self.function_obj.py_result()};")
+                code.put_incref(self_arg, py_object_type)
             return code.get_py_string_const(self.function.attribute)
 
         code.putln(f"{self_arg} = NULL;")
@@ -7904,6 +7915,7 @@ class GeneralCallNode(CallNode):
     def analyse_types(self, env):
         if (as_type_constructor := self.analyse_as_type_constructor(env)) is not None:
             return as_type_constructor
+        self.function.is_called = 1
         self.function = self.function.analyse_types(env)
         if not self.function.type.is_pyobject:
             if self.function.type.is_error:
