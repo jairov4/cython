@@ -8561,14 +8561,23 @@ class AttributeNode(ExprNode):
         if self.obj.is_string_literal:
             return
         type = self.obj.analyse_as_type(env)
+        from_value_class = False
         if type and type.is_value_class and type.boxed_type is not None:
             # value_type: methods live on the boxed extension type's scope, so an
             # unbound C method reference (e.g. Vec2.__init__) must resolve there.
             type = type.boxed_type
+            from_value_class = True
         if type:
             if type.is_extension_type or type.is_builtin_type or type.is_cpp_class:
                 entry = type.scope.lookup_here(self.attribute)
                 if entry and (entry.is_cmethod or type.is_cpp_class and entry.type.is_cfunction):
+                    if (from_value_class and not self.is_called
+                            and entry.type.is_classmethod):
+                        # A value_type classmethod used as a value (not called):
+                        # resolve via the boxed type's Python attribute so we get a
+                        # bound classmethod, not the unbound C-method pointer (whose
+                        # to_py wrapper would still require the 'cls' argument).
+                        return None
                     if type.is_builtin_type:
                         if not self.is_called:
                             # must handle this as Python object
