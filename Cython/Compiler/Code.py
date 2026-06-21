@@ -3092,13 +3092,11 @@ class CCodeWriter:
             self.put_safe(" = %s" % entry.type.literal_code(entry.init))
         elif entry.type.is_pyobject:
             self.put(" = NULL")
-        self.putln(";")
-        if (entry.init is None and not entry.type.is_pyobject
-                and (entry.type.is_value_class or entry.type.is_nullable_value)
-                and entry.type.needs_refcounting):
+        elif (entry.type.is_value_class or entry.type.is_nullable_value) and entry.type.needs_refcounting:
             # Zero-initialise so that XDECREF at scope exit or on first read
             # doesn't chase garbage pointers in the object fields.
-            self.putln("memset(&%s, 0, sizeof(%s));" % (entry.cname, entry.cname))
+            self.put(" = {0}")
+        self.putln(";")
         self.globalstate.use_entry_utility_code(entry)
 
     def put_temp_declarations(self, func_context: FunctionState):
@@ -3114,8 +3112,7 @@ class CCodeWriter:
             elif (type.is_value_class or type.is_nullable_value) and type.needs_refcounting:
                 # Zero-initialise so that XDECREF on exception paths doesn't
                 # chase garbage pointers in the struct's object fields.
-                self.putln("%s%s; memset(&%s, 0, sizeof(%s));" % (
-                    static and "static " or "", decl, name, name))
+                self.putln("%s%s = {0};" % (static and "static " or "", decl))
             else:
                 self.putln("%s%s;" % (static and "static " or "", decl))
 
