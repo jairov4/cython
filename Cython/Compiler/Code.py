@@ -3094,7 +3094,7 @@ class CCodeWriter:
             self.put(" = NULL")
         self.putln(";")
         if (entry.init is None and not entry.type.is_pyobject
-                and entry.type.is_value_class
+                and (entry.type.is_value_class or entry.type.is_nullable_value)
                 and entry.type.needs_refcounting):
             # Zero-initialise so that XDECREF at scope exit or on first read
             # doesn't chase garbage pointers in the object fields.
@@ -3111,7 +3111,7 @@ class CCodeWriter:
                 self.putln("%s = NULL;" % decl)
             elif type.is_memoryviewslice:
                 self.putln("%s = %s;" % (decl, type.literal_code(type.default_value)))
-            elif type.is_value_class and type.needs_refcounting:
+            elif (type.is_value_class or type.is_nullable_value) and type.needs_refcounting:
                 # Zero-initialise so that XDECREF on exception paths doesn't
                 # chase garbage pointers in the struct's object fields.
                 self.putln("%s%s; memset(&%s, 0, sizeof(%s));" % (
