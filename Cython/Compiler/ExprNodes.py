@@ -6698,6 +6698,12 @@ class SimpleCallNode(CallNode):
     arg_tuple = None
     wrapper_call = False
     has_optional_args = False
+    # optional_arg_bits: None means the supplied optional args are dense
+    # (filled contiguously from the first optional, bit i == position i).
+    # A list maps each supplied optional arg (in self.args order, after the
+    # required args) to its declared optional ordinal == its bit in the
+    # bitmask opt-args ABI, allowing sparse/out-of-order keyword fills.
+    optional_arg_bits = None
     nogil = False
     analysed = False
     overflowcheck = False
@@ -6995,8 +7001,16 @@ class SimpleCallNode(CallNode):
 
         # Coerce arguments
         some_args_in_temps = False
+        opt_bits = self.optional_arg_bits
         for i in range(min(max_nargs, actual_nargs)):
-            formal_arg = func_type.args[i]
+            # With sparse optional args the i-th supplied arg beyond the
+            # required ones maps to its declared optional ordinal rather than
+            # to func_type.args[i].  opt_bits is None for dense calls (identity).
+            if opt_bits is not None and i >= expected_nargs:
+                formal_index = expected_nargs + opt_bits[i - expected_nargs]
+            else:
+                formal_index = i
+            formal_arg = func_type.args[formal_index]
             formal_type = formal_arg.type
             # value_type self ABI: the formal self param is __pyx_val_T *.  When
             # called unbound (Type.method(self, ...) form — the auto-generated
@@ -7309,16 +7323,22 @@ class SimpleCallNode(CallNode):
                 expected_nargs = len(func_type.args) - func_type.optional_arg_count
                 self.opt_arg_struct = code.funcstate.allocate_temp(
                     func_type.op_arg_struct.base_type, manage_ref=True)
-                code.putln("%s.%s = %s;" % (
-                        self.opt_arg_struct,
-                        Naming.pyrex_prefix + "n",
-                        len(self.args) - expected_nargs))
-                args = list(zip(func_type.args, self.args))
-                for formal_arg, actual_arg in args[expected_nargs:actual_nargs]:
+                opt_bits = self.optional_arg_bits
+                mask = 0
+                for i, actual_arg in enumerate(self.args[expected_nargs:actual_nargs]):
+                    # bit == declared optional ordinal of this supplied arg
+                    # (dense calls fill them contiguously, so bit == i).
+                    bit = i if opt_bits is None else opt_bits[i]
+                    formal_arg = func_type.args[expected_nargs + bit]
                     code.putln("%s.%s = %s;" % (
                             self.opt_arg_struct,
                             func_type.opt_arg_cname(formal_arg.name),
                             actual_arg.result_as(formal_arg.type)))
+                    mask |= (1 << bit)
+                code.putln("%s.%s = %sU;" % (
+                        self.opt_arg_struct,
+                        Naming.pyrex_prefix + "n",
+                        mask))
             exc_checks = []
             if self.type.is_pyobject and self.is_temp and not func_type.never_raises:
                 exc_checks.append("!%s" % self.result())
@@ -8022,6 +8042,13 @@ class GeneralCallNode(CallNode):
                                                      len(pos_args)))
             return None
 
+        # Number of required (non-optional) declared args, in this 'self'/'cls'-
+        # stripped space.  Optional args are the trailing ones and may be left
+        # unfilled: the bitmask opt-args ABI lets the callee keep its own
+        # default for a skipped optional, so keyword "gaps" no longer force a
+        # Python call.
+        expected_nargs = len(declared_args) - function_type.optional_arg_count
+
         matched_args = {
             arg.name for arg in declared_args[:len(pos_args)]
             if arg.name
@@ -8029,6 +8056,9 @@ class GeneralCallNode(CallNode):
         unmatched_args = declared_args[len(pos_args):]
         matched_kwargs_count = 0
         args = list(pos_args)
+        # Declared-arg slot index for each entry in `args`, kept parallel so we
+        # can build the optional-arg bitmask for sparse keyword fills.
+        arg_slots = list(range(len(pos_args)))
 
         # check for duplicate keywords
         seen = set(matched_args)
@@ -8046,8 +8076,9 @@ class GeneralCallNode(CallNode):
             name = arg.key.value
             if decl_arg.name == name:
                 matched_args.add(name)
-                matched_kwargs_count += 1
                 args.append(arg.value)
+                arg_slots.append(len(pos_args) + matched_kwargs_count)
+                matched_kwargs_count += 1
             else:
                 break
 
@@ -8057,31 +8088,26 @@ class GeneralCallNode(CallNode):
         from .UtilNodes import EvalWithTempExprNode, LetRefNode
         temps = []
         if len(kwargs.key_value_pairs) > matched_kwargs_count:
-            unmatched_args = declared_args[len(args):]
+            base = len(args)
+            unmatched_args = declared_args[base:]
             keywords = {arg.key.value: (i+len(pos_args), arg)
                         for i, arg in enumerate(kwargs.key_value_pairs)}
-            first_missing_keyword = None
-            for decl_arg in unmatched_args:
+            for offset, decl_arg in enumerate(unmatched_args):
+                slot = base + offset
                 name = decl_arg.name
                 if name not in keywords:
-                    # missing keyword argument => either done or error
-                    if not first_missing_keyword:
-                        first_missing_keyword = name
+                    if slot < expected_nargs:
+                        # a *required* argument is missing
+                        if (entry.as_variable or (entry.is_cmethod and function_type.is_overridable)
+                                or _is_unbound_classmethod):
+                            # A Python form exists (plain cpdef, inherited cpdef
+                            # wrapper, or classmethod descriptor) => Python dispatch.
+                            return self
+                        error(self.pos, "C function call is missing "
+                                        "argument '%s'" % name)
+                        return None
+                    # a missing *optional* argument is a legal gap in the bitmask ABI
                     continue
-                elif first_missing_keyword:
-                    if (entry.as_variable or (entry.is_cmethod and function_type.is_overridable)
-                            or _is_unbound_classmethod):
-                        # Fall back to a Python call: either the function has a Python
-                        # form (as_variable), or it is an inherited cpdef whose
-                        # as_variable is None but that still has a Python wrapper.
-                        # Classmethods always have a Python descriptor for keyword dispatch.
-                        # We only support optional arguments at the end in the C ABI,
-                        # so gaps in keyword args require Python dispatch.
-                        return self
-                    # wasn't the last keyword => gaps are not supported
-                    error(self.pos, "C function call is missing "
-                                    "argument '%s'" % first_missing_keyword)
-                    return None
                 pos, arg = keywords[name]
                 matched_args.add(name)
                 matched_kwargs_count += 1
@@ -8092,13 +8118,15 @@ class GeneralCallNode(CallNode):
                     assert temp.is_simple()
                     args.append(temp)
                     temps.append((pos, temp))
+                arg_slots.append(slot)
 
             if temps:
                 # may have to move preceding non-simple args into temps
                 final_args = []
+                final_slots = []
                 new_temps = []
                 first_temp_arg = temps[0][-1]
-                for arg_value in args:
+                for arg_value, arg_slot in zip(args, arg_slots):
                     if arg_value is first_temp_arg:
                         break  # done
                     if arg_value.is_simple():
@@ -8107,8 +8135,10 @@ class GeneralCallNode(CallNode):
                         temp = LetRefNode(arg_value)
                         new_temps.append(temp)
                         final_args.append(temp)
+                    final_slots.append(arg_slot)
                 if new_temps:
                     args = final_args
+                    arg_slots = final_slots
                 temps = new_temps + [ arg for i,arg in sorted(temps) ]
 
         # check for unexpected keywords
@@ -8127,6 +8157,12 @@ class GeneralCallNode(CallNode):
         # all keywords mapped to positional arguments
         # if we are missing arguments, SimpleCallNode will figure it out
         node = SimpleCallNode(self.pos, function=function, args=args)
+        # Record sparse optional fills so codegen sets only the matching bits.
+        # A dense fill (optionals filled contiguously from the first one) keeps
+        # the default None, which codegen treats as the identity mapping.
+        optional_bits = [s - expected_nargs for s in arg_slots if s >= expected_nargs]
+        if optional_bits != list(range(len(optional_bits))):
+            node.optional_arg_bits = optional_bits
         for temp in temps[::-1]:
             node = EvalWithTempExprNode(temp, node)
         return node

@@ -1,3 +1,4 @@
+cimport cython
 from cython cimport typeof
 
 def call2():
@@ -67,3 +68,24 @@ cdef class C(B):
         ('C', 100)
         """
         return typeof(self), x
+
+
+# Sparse optional arguments: keyword calls that skip leading optionals are
+# lowered to C calls that set only the matching bits of the opt-args bitmask
+# (no Python dispatch).  The absence of a //GeneralCallNode proves the C path.
+cdef tuple sparse_opt(int a=10, int b=20, int c=30, int d=40, int e=50):
+    return (a, b, c, d, e)
+
+@cython.test_fail_if_path_exists("//GeneralCallNode")
+def test_sparse_kwargs():
+    """
+    >>> test_sparse_kwargs()
+    [(10, 20, 30, 40, 50), (10, 20, 99, 40, 50), (10, 20, 30, 40, 7), (1, 20, 30, 4, 50), (10, 5, 30, 40, 9)]
+    """
+    return [
+        sparse_opt(),
+        sparse_opt(c=99),
+        sparse_opt(e=7),
+        sparse_opt(1, d=4),
+        sparse_opt(b=5, e=9),
+    ]

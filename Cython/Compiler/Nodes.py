@@ -931,7 +931,9 @@ class CFuncDeclaratorNode(CDeclaratorNode):
         """
         scope = StructOrUnionScope()
         arg_count_member = '%sn' % Naming.pyrex_prefix
-        scope.declare_var(arg_count_member, PyrexTypes.c_int_type, self.pos)
+        if self.optional_arg_count > 32:
+            error(self.pos, "Cannot have more than 32 optional arguments (ABI uses a 32-bit bitmask)")
+        scope.declare_var(arg_count_member, PyrexTypes.c_uint_type, self.pos)
 
         for arg in func_type.args[len(func_type.args) - self.optional_arg_count:]:
             scope.declare_var(arg.name, arg.type, arg.pos, allow_pyobject=True, allow_memoryview=True)
@@ -3670,7 +3672,6 @@ class CFuncDefNode(FuncDefNode):
 
     def generate_argument_parsing_code(self, env, code):
         i = 0
-        used = 0
         scope = self.local_scope
         if self.type.optional_arg_count:
             code.putln('if (%s) {' % Naming.optional_args_cname)
@@ -3678,7 +3679,7 @@ class CFuncDefNode(FuncDefNode):
                 if arg.default:
                     entry = scope.lookup(arg.name)
                     if self.override or entry.cf_used:
-                        code.putln('if (%s->%sn > %s) {' %
+                        code.putln('if (%s->%sn & (1U << %s)) {' %
                                    (Naming.optional_args_cname,
                                     Naming.pyrex_prefix, i))
                         declarator = arg.declarator
@@ -3687,10 +3688,8 @@ class CFuncDefNode(FuncDefNode):
                         code.putln('%s = %s->%s;' %
                                    (arg.cname, Naming.optional_args_cname,
                                     self.type.opt_arg_cname(declarator.name)))
-                        used += 1
+                        code.putln('}')
                     i += 1
-            for _ in range(used):
-                code.putln('}')
             code.putln('}')
 
         # Move arguments into closure if required
