@@ -323,16 +323,19 @@ def create_py_pipeline(context, options, result):
 
 def create_pyx_as_pxd_pipeline(context, result):
     from .ParseTreeTransforms import AlignFunctionDefinitions, \
-        WithTransform, AnalyseDeclarationsTransform
+        AnalyseDeclarationsTransform
     from .Optimize import ConstantFolding, FlattenInListTransform
     from .Nodes import StatListNode
     pipeline = []
+    # WithTransform must NOT be excluded: AnalyseDeclarationsTransform calls
+    # body.analyse_declarations() on function bodies, and WithStatNode.analyse_declarations
+    # requires enter_call to be set (done by WithTransform).  The body transformation
+    # is harmless here because the pxd pipeline stops right after AnalyseDeclarationsTransform.
     pyx_pipeline = create_pyx_pipeline(context, context.options, result,
                                        exclude_classes=[
                                            AlignFunctionDefinitions,
                                            ConstantFolding,
                                            FlattenInListTransform,
-                                           WithTransform
                                            ])
     from .Visitor import VisitorTransform
     class SetInPxdTransform(VisitorTransform):
