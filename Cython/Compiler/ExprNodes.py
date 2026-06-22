@@ -8092,22 +8092,34 @@ class GeneralCallNode(CallNode):
             unmatched_args = declared_args[base:]
             keywords = {arg.key.value: (i+len(pos_args), arg)
                         for i, arg in enumerate(kwargs.key_value_pairs)}
+            # Track the first required argument whose name is absent from the
+            # supplied keywords.  We defer the "missing argument" error until we
+            # confirm the gap is genuine — i.e. that a later declared argument IS
+            # supplied as a keyword (so the gap can't be explained by the caller
+            # simply providing unexpected kwargs that land in no declared slot).
+            # This matches the pre-bitmask behaviour and avoids cascading noise
+            # when only "unexpected keyword" errors should be reported.
+            first_missing_required = None
             for offset, decl_arg in enumerate(unmatched_args):
                 slot = base + offset
                 name = decl_arg.name
                 if name not in keywords:
-                    if slot < expected_nargs:
-                        # a *required* argument is missing
-                        if (entry.as_variable or (entry.is_cmethod and function_type.is_overridable)
-                                or _is_unbound_classmethod):
-                            # A Python form exists (plain cpdef, inherited cpdef
-                            # wrapper, or classmethod descriptor) => Python dispatch.
-                            return self
-                        error(self.pos, "C function call is missing "
-                                        "argument '%s'" % name)
-                        return None
+                    if slot < expected_nargs and not has_errors:
+                        # Record missing required arg; error deferred until we see
+                        # whether a later slot IS matched (genuine gap).
+                        if not first_missing_required:
+                            first_missing_required = name
                     # a missing *optional* argument is a legal gap in the bitmask ABI
                     continue
+                # This slot IS supplied as a keyword — confirm any prior gap.
+                if first_missing_required:
+                    if (entry.as_variable or (entry.is_cmethod and function_type.is_overridable)
+                            or _is_unbound_classmethod):
+                        # Python form exists => fall back to Python dispatch.
+                        return self
+                    error(self.pos, "C function call is missing "
+                                    "argument '%s'" % first_missing_required)
+                    return None
                 pos, arg = keywords[name]
                 matched_args.add(name)
                 matched_kwargs_count += 1
@@ -14385,10 +14397,9 @@ class DivNode(NumBinopNode):
             self.compile_time_value_error(e)
 
     def _check_truedivision(self, env):
-        if self.cdivision or env.directives['cdivision']:
-            self.ctruedivision = False
-        else:
-            self.ctruedivision = self.truedivision
+        # cdivision governs floor-division rounding ('//','%') and zero-division checks,
+        # NOT whether true division ('/') produces a float. '/' always stays true division.
+        self.ctruedivision = self.truedivision
 
     def infer_type(self, env):
         self._check_truedivision(env)
@@ -14430,7 +14441,7 @@ class DivNode(NumBinopNode):
         return result  # should either be self, or wrap self
 
     def compute_c_result_type(self, type1, type2):
-        if self.operator == '/' and self.ctruedivision and not type1.is_cpp_class and not type2.is_cpp_class:
+        if self.operator == '/' and self.ctruedivision and type1.is_numeric and type2.is_numeric:
             if not type1.is_float and not type2.is_float:
                 widest_type = PyrexTypes.widest_numeric_type(type1, PyrexTypes.c_double_type)
                 widest_type = PyrexTypes.widest_numeric_type(type2, widest_type)

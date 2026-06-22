@@ -65,6 +65,23 @@ class Divider:
         return self.n / d
 
 
+@value_type
+@final
+@cclass
+@dataclass(frozen=True)
+class Fraction:
+    # A rational number as a value type with __truediv__.
+    # Regression: DivNode.compute_c_result_type used to crash with
+    # AttributeError: 'CValueClassType' has no attribute 'rank' when
+    # cdivision=True and both operands are a value type.
+    num: cython.int
+    den: cython.int
+
+    @cython.cdivision(True)
+    def __truediv__(self, other: Fraction) -> Fraction:
+        return Fraction(self.num * other.den, self.den * other.num)
+
+
 # NOTE (v1 limitations, verified empirically):
 #  * Nested value-type fields (a value_type field whose type is ANOTHER
 #    value_type class) are NOT supported: the synthesized __hash__/__eq__ try
@@ -176,6 +193,21 @@ def ctuple_field():
     """
     t = TupleHolder((1.0, 2.0), True)
     return t.coords[0], t.flag, t.first_coord()
+
+
+def binop_truediv():
+    """
+    value_type __truediv__ dispatches as a direct C call, not as numeric float
+    widening. This was crashing with AttributeError on 'rank' when cdivision=True.
+
+    >>> binop_truediv()
+    (12, 2)
+    """
+    # (3/1) / (2/4) = (3*4) / (1*2) = 12/2  (unreduced rational)
+    a = Fraction(3, 1)
+    b = Fraction(2, 4)
+    r = a / b
+    return r.num, r.den
 
 
 def exceptval_method():

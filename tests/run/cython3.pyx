@@ -65,11 +65,24 @@ def truediv_int(int x):
 def cdiv_int(int x):
     """
     >>> cdiv_int(4)
-    2
+    2.0
     >>> cdiv_int(3)
-    1
+    1.5
     """
     return x / 2
+
+
+@cython.cdivision(True)
+def cdiv_consistency(int a, int b):
+    """
+    Prove that under cdivision=True, '/' still produces a float (true division)
+    while '//' gives C integer truncation (toward zero, not floor).
+    >>> cdiv_consistency(7, 2)
+    (3.5, 3, 'double')
+    >>> cdiv_consistency(-7, 2)
+    (-3.5, -3, 'double')
+    """
+    return a / b, a // b, cython.typeof(a / b)
 
 
 ### module level except-as tests
