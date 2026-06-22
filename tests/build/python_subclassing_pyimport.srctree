@@ -1,0 +1,44 @@
+# Verify that Python-style imports do NOT trigger the compile-time
+# python_subclassing check (Cython must not follow Python imports to load
+# pxd/pyx for type info).  The runtime __init_subclass__ guard still fires.
+
+PYTHON setup.py build_ext --inplace
+PYTHON run_test.py
+
+######## setup.py ########
+from setuptools import setup
+from Cython.Build import cythonize
+setup(ext_modules=cythonize(['base_mod.pyx', 'consumer.pyx'], language_level=3))
+
+######## base_mod.pyx ########
+# cython: python_subclassing=False
+
+cdef class Base:
+    cpdef int method(self):
+        return 42
+
+######## consumer.pyx ########
+# Python import — Cython must not open base_mod.pxd/pyx to check
+# python_subclassing; this file must compile without any error.
+from base_mod import Base
+
+def create_subclass():
+    """Create a Python subclass at runtime; __init_subclass__ must raise."""
+    class PyChild(Base):
+        pass
+    return PyChild
+
+######## run_test.py ########
+import sys
+
+import base_mod
+import consumer  # must import without error (no compile-time check triggered)
+
+try:
+    consumer.create_subclass()
+    print("FAIL: expected TypeError from __init_subclass__")
+    sys.exit(1)
+except TypeError:
+    pass
+
+print("OK")

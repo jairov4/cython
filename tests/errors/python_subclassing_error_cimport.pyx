@@ -1,9 +1,9 @@
 # mode: error
 
-# Python import (not cimport) of a cdef class with python_subclassing=False.
-# The compile-time check should still fire via pxd fallback lookup.
+# Cross-module cimport: when the base class is cimported (not Python-imported)
+# Cython does know its python_subclassing=False at compile time and must error.
 
-from python_subclassing_pyimport_base import Base
+from python_subclassing_pyimport_base cimport Base
 
 class PyChild(Base):  # should error
     pass

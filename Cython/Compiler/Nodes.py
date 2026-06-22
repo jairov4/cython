@@ -6273,10 +6273,7 @@ class PyClassDefNode(ClassDefNode):
                 entry = None
             scope = self._resolve_extension_scope(env, entry)
             if scope and not getattr(scope, 'python_subclassing', True):
-                if entry and entry.type and entry.type.is_extension_type:
-                    type_name = entry.type.name
-                else:
-                    type_name = getattr(entry, 'python_import_name', entry.name if entry else '?')
+                type_name = entry.type.name if (entry and entry.type and entry.type.is_extension_type) else '?'
                 error(self.pos,
                       "Python class '%s' inherits from extension type '%s' which has "
                       "python_subclassing=False; declare it as a cdef class or add "
@@ -6285,30 +6282,11 @@ class PyClassDefNode(ClassDefNode):
 
     @staticmethod
     def _resolve_extension_scope(env, entry):
-        """Return the cdef-class scope for entry, with pxd fallback for Python-imported names."""
+        """Return the cdef-class scope for entry, only if it was explicitly cimported."""
         if not entry:
             return None
         if entry.type and entry.type.is_extension_type:
             return entry.type.scope
-        # entry may have been created by FromImportStatNode with py_object_type;
-        # try loading the pxd to get the real type.
-        module_name = getattr(entry, 'python_import_module', None)
-        if module_name is None:
-            return None
-        try:
-            module_scope = env.find_module(
-                module_name,
-                pos=entry.pos,
-                relative_level=getattr(entry, 'python_import_level', 0),
-                need_pxd=0)  # silent: don't emit "pxd not found" for Python-import fallback
-        except Exception:
-            return None
-        if not module_scope:
-            return None
-        original_name = getattr(entry, 'python_import_name', entry.name)
-        pxd_entry = module_scope.lookup(original_name)
-        if pxd_entry and pxd_entry.type and pxd_entry.type.is_extension_type:
-            return pxd_entry.type.scope
         return None
 
     update_bases_functype = PyrexTypes.CFuncType(
