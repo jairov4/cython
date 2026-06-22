@@ -135,6 +135,22 @@ for bad in ('__Pyx_tp_new', 'PyObject_Call', '__Pyx_PyObject_Call'):
 assert re.search(r'pyx_f_2vt_8datetime___sub__\(\(&', sub_sec), \
     "value-ABI datetime.__sub__ call not found in sub_to_seconds"
 
+# --- (10) noexcept value-type classmethod called with sparse keywords -------
+# timedelta.new is a final (value_type) classmethod whose body cannot raise, so
+# infer_noexcept must drop the post-call PyErr check even though the call site
+# holds a *copy* of the CFuncType (classmethod cls-injection).  The sparse
+# keyword fills must also become a direct C call with the opt-args bitmask.
+mts = function_body(content, '__pyx_f_2vt_make_td_sparse(')
+new_calls = re.findall(r'__pyx_f_2vt_\d+timedelta_new\([^\n]*\n([^\n]*)', mts)
+assert new_calls, "timedelta.new call sites not found in make_td_sparse"
+for follow in new_calls:
+    assert 'PyErr_Occurred' not in follow and '__PYX_ERR' not in follow, \
+        "unexpected exception check after noexcept value classmethod call:\n%s" % follow
+# Sparse bitmask: seconds is optional ordinal 1 -> bit 1 (mask 2); days+micros
+# are ordinals 0 and 2 -> mask 5.  Both set the opt-args struct's __pyx_n.
+assert '__pyx_n = 2U;' in mts, "expected seconds-only bitmask (2U) in make_td_sparse"
+assert '__pyx_n = 5U;' in mts, "expected days+micros bitmask (5U) in make_td_sparse"
+
 print("OK: value_type codegen assertions passed")
 
 ######## run_test.py ########
@@ -150,6 +166,7 @@ assert vt.abs_and_total_seconds(vt.Duration(2_000_000)) == 2.0, vt.abs_and_total
 d1 = vt.datetime(2_000_000)
 d2 = vt.datetime(500_000)
 assert vt.sub_to_seconds(d1, d2) == 1.5, vt.sub_to_seconds(d1, d2)
+assert vt.make_td_sparse() == 5_000_000 + (86_400_000_000 + 3), vt.make_td_sparse()
 print("DONE: value_type runtime tests passed")
 
 ######## vt.pyx ########
@@ -239,8 +256,21 @@ cdef class timedelta:
             return -self
         return self
 
+    @classmethod
+    def new(cls, days: cython.longlong = 0, seconds: cython.longlong = 0,
+            micros: cython.longlong = 0) -> timedelta:
+        return timedelta(days * 86_400_000_000 + seconds * 1_000_000 + micros)
+
 
 cpdef double sub_to_seconds(datetime d1, datetime d2):
     """(d1 - d2).total_seconds() — cross-value-type reference."""
     cdef timedelta td = d1 - d2
     return td.us / 1_000_000.0
+
+
+cpdef long long make_td_sparse():
+    """timedelta.new(seconds=...) / .new(days=, micros=) — sparse-keyword C calls
+    to a noexcept value-type classmethod: bitmask opt-args + no PyErr check."""
+    cdef timedelta a = timedelta.new(seconds=5)
+    cdef timedelta b = timedelta.new(days=1, micros=3)
+    return a.us + b.us

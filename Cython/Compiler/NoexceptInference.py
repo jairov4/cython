@@ -933,9 +933,6 @@ class InferNoexcept(CythonTransform):
         return node
 
     def _try_tier2(self, node):
-        if not getattr(node, 'wrapper_call', False):
-            return
-
         # Must be the infer_noexcept directive active at this call site.
         if not self.current_directives.get('infer_noexcept', True):
             return
@@ -957,6 +954,8 @@ class InferNoexcept(CythonTransform):
         if func_type.never_raises:
             return  # already marked
 
+        wrapper_call = node.wrapper_call
+
         # Resolve cname.  RawCNameExprNode / PythonCapiFunctionNode store it
         # directly.  NameNodes (produced from AttributeNode.as_name_node for
         # unbound-cmethod calls) carry it on their entry.
@@ -974,11 +973,27 @@ class InferNoexcept(CythonTransform):
         if target_node is not None:
             if not self._analysis.body_cannot_raise(target_node):
                 return
+            # Dispatch safety.  body_cannot_raise tells us the *analysed* body is
+            # safe; we still need the call site to provably execute exactly that
+            # body.  Two cases qualify:
+            #   * entry-marked target (phase 2 set never_raises on its canonical
+            #     type): a final cmethod or non-overridable module function — no
+            #     vtable override can replace the body, so *every* direct call to
+            #     its func_cname is safe, even without skip_dispatch.  This is the
+            #     general case that lets call sites holding a *copy* of the
+            #     CFuncType (classmethods, value-type methods) drop their check.
+            #   * otherwise only a 'direct' fact holds (non-final cmethod, body is
+            #     safe but reachable through an override): require skip_dispatch.
+            target_marked = target_node.type.never_raises
+            if not (wrapper_call or target_marked):
+                return
         else:
             # Cross-module direct call (e.g. `vtabptr->__pyx___init__` from the
             # super()/ctor optimizers): trust the target module's own analysis
             # via the injected facts.  skip_dispatch=1 guarantees the executed
             # code is exactly the analysed body.
+            if not wrapper_call:
+                return
             entry = (getattr(func_node, 'entry', None)
                      or getattr(func_type, 'entry', None))
             if _external_fact_for_entry(entry) not in ('entry', 'direct'):
