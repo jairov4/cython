@@ -926,12 +926,23 @@ def _set_up_dataclass_fields(node, fields, dataclass_module):
             module_field_name = global_scope.mangle(
                 global_scope.mangle(Naming.dataclass_field_default_cname, node.class_name),
                 name)
-            # create an entry in the global scope for this variable to live
+            # create an entry in the global scope for this variable to live.
+            # Use the field's declared scope-entry type (known at declare-time) so that
+            # C-typed fields (float, value_type structs, etc.) get the right C type in
+            # the module var.  Fall back to the default-expression type, then
+            # py_object_type, as a last resort (never unspecified_type — that renders
+            # as "<unspecified>" in cross-module C declarations).
+            field_entry = node.scope.entries.get(name)
+            var_type = (
+                (field_entry.type if field_entry and field_entry.type
+                                  and not field_entry.type.is_unspecified else None)
+                or field_default.type
+                or PyrexTypes.py_object_type
+            )
             field_node = ExprNodes.NameNode(field_default.pos, name=EncodedString(module_field_name))
             field_node.entry = global_scope.declare_var(
-                field_node.name, type=field_default.type or PyrexTypes.unspecified_type,
+                field_node.name, type=var_type,
                 pos=field_default.pos, cname=field_node.name, is_cdef=True,
-                # TODO: do we need to set 'pytyping_modifiers' here?
             )
             # replace the field so that future users just receive the namenode
             setattr(field, attrname, field_node)
