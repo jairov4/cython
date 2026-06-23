@@ -2721,6 +2721,9 @@ static pthread_mutex_t __Pyx_ModuleStateLookup_mutex = PTHREAD_MUTEX_INITIALIZER
 
 #elif defined(_WIN32)
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <Windows.h>  // synchapi.h on its own doesn't work
 
 // Using a slim-read-write lock (instead of a mutex/critical section)
