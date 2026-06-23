@@ -911,6 +911,10 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             code.putln("END: Cython Metadata */")
             code.putln("")
 
+        code.putln("#ifndef NOMINMAX")
+        code.putln("#define NOMINMAX")
+        code.putln("#endif /* NOMINMAX */")
+
         code.putln("#ifndef PY_SSIZE_T_CLEAN")
         code.putln("#define PY_SSIZE_T_CLEAN")
         code.putln("#endif /* PY_SSIZE_T_CLEAN */")

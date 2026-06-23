@@ -934,7 +934,7 @@ static CYTHON_INLINE PyObject * __Pyx_PyDict_GetItemStr(PyObject *dict, PyObject
     PyObject *res = __Pyx_PyDict_GetItemStrWithError(dict, name);
     if (res == NULL && PyErr_Occurred()) {
         // Like PyDict_GetItem, this is a bit indiscriminate about catching *all* errors.
-        // Recent versions of Python format any unraised exception so do that too here. 
+        // Recent versions of Python format any unraised exception so do that too here.
         PyErr_WriteUnraisable(NULL);
     }
     return res;
@@ -2721,9 +2721,6 @@ static pthread_mutex_t __Pyx_ModuleStateLookup_mutex = PTHREAD_MUTEX_INITIALIZER
 
 #elif defined(_WIN32)
 
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <Windows.h>  // synchapi.h on its own doesn't work
 
 // Using a slim-read-write lock (instead of a mutex/critical section)
