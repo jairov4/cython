@@ -3203,11 +3203,20 @@ class PropertyScope(Scope):
             if len(type.args) != 2:
                 error(pos, "C property setter must have two arguments (self and value)")
 
-        if not (type.args[0].type.is_pyobject or type.args[0].type is self.parent_scope.parent_type):
+        _value_struct = self.parent_scope.parent_type.equivalent_type
+        _is_value_ptr_self = (
+            _value_struct is not None
+            and type.args[0].type.is_ptr
+            and type.args[0].type.base_type is _value_struct
+        )
+        if not (type.args[0].type.is_pyobject
+                or type.args[0].type is self.parent_scope.parent_type
+                or _is_value_ptr_self):
             error(pos, "self argument of C property method must be an object")
         if type.args and type.args[0].type is py_object_type:
             # Set 'self' argument type to extension type.
             type.args[0].type = self.parent_scope.parent_type
+        # If already __pyx_val_T *, leave as-is (value_type property ABI).
 
         entry = Scope.declare_cfunction(self, name, type, pos, *args, **kwargs)
         # Set the signature to the property accessor signature for __get__, __set__, __del__

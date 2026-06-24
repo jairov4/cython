@@ -764,12 +764,21 @@ class CFuncDeclaratorNode(CDeclaratorNode):
             # normalised to a pointer to the value struct here.  Synthesized
             # dataclass dunders are suppressed (see Dataclass.handle_cclass_dataclass)
             # and keep ext-object self.
-            if (i == 0 and env.is_c_class_scope
-                    and getattr(env, 'is_value_class_scope', False)
-                    and not getattr(env, '_suppress_value_self_swap', False)
-                    and env.parent_type.equivalent_type is not None):
-                value_struct = env.parent_type.equivalent_type
-                if type.same_as(env.parent_type) or type.same_as(value_struct):
+            # Property getters/setters run in PropertyScope, not CClassScope — use
+            # parent_scope to reach the CClassScope for the is_value_class_scope check.
+            _eff_env = env
+            if env.is_property_scope:
+                _eff_env = env.parent_scope
+            if (i == 0 and _eff_env.is_c_class_scope
+                    and getattr(_eff_env, 'is_value_class_scope', False)
+                    and not getattr(_eff_env, '_suppress_value_self_swap', False)
+                    and _eff_env.parent_type.equivalent_type is not None):
+                value_struct = _eff_env.parent_type.equivalent_type
+                # In a PropertyScope is_self_arg is False so the untyped self stays
+                # as py_object_type rather than being resolved to the ext type —
+                # treat that as equivalent to the owner type for the swap.
+                if (type.same_as(_eff_env.parent_type) or type.same_as(value_struct)
+                        or (env.is_property_scope and type is PyrexTypes.py_object_type)):
                     type = PyrexTypes.c_ptr_type(value_struct)
             # Turn *[] argument into **
             if type.is_array:

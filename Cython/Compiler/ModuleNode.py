@@ -3290,6 +3290,15 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         # Cast o to the correct type for C++ compatibility
         is_overridable = property_scope.is_overridable
         ext_type = property_scope.parent_type
+        # Detect value_type property: getter's self arg is __pyx_val_T * (not __pyx_obj_T *).
+        # In that case extract &obj->__pyx_value instead of casting the PyObject* directly.
+        get_self_type = (get_entry.type.args[0].type
+                         if get_entry.is_cfunction and get_entry.type.args else None)
+        uses_value_self = (
+            get_self_type is not None
+            and get_self_type.is_ptr
+            and get_self_type.base_type.is_value_class
+        )
         # For cpdef properties, cast to struct type, not PyTypeObject*
         # Only cast when the getter is a C function (is_cfunction), not a Python wrapper.
         use_struct_cast = is_overridable and ext_type.objstruct_cname and get_entry.is_cfunction
@@ -3303,7 +3312,13 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             "static PyObject *%s(PyObject *o, CYTHON_UNUSED void *x) {" % (
                 property_entry.getter_cname))
 
-        if use_struct_cast:
+        if uses_value_self:
+            # value_type property: extract &((objstruct*)o)->__pyx_value and pass as
+            # __pyx_val_T * to the C getter (which uses value ABI for self).
+            objstruct_cast = "struct %s *" % ext_type.objstruct_cname
+            call_code = "%s(&((%s)o)->%s)" % (
+                get_entry.func_cname, objstruct_cast, Naming.value_member_cname)
+        elif use_struct_cast:
             call_code = "%s((%s)o)" % (get_entry.func_cname, parent_type_cname)
         else:
             call_code = "%s(o)" % (get_entry.func_cname)
@@ -3338,6 +3353,14 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         # Cast o and v to the correct types for C++ compatibility
         is_overridable = property_scope.is_overridable
         ext_type = property_scope.parent_type
+        # Detect value_type property: setter's self arg is __pyx_val_T * (not __pyx_obj_T *).
+        set_self_type = (set_entry.type.args[0].type
+                         if set_entry.is_cfunction and set_entry.type.args else None)
+        uses_value_self = (
+            set_self_type is not None
+            and set_self_type.is_ptr
+            and set_self_type.base_type.is_value_class
+        )
         # For cpdef properties, cast to struct type, not PyTypeObject*
         # Only cast when the setter is a C function (is_cfunction), not a Python wrapper.
         use_struct_cast = is_overridable and ext_type.objstruct_cname and set_entry.is_cfunction
@@ -3353,7 +3376,38 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             "static int %s(PyObject *o, PyObject *v, CYTHON_UNUSED void *x) {" % (
                 property_entry.setter_cname))
         code.putln("if (v) {")
-        if use_struct_cast:
+        if uses_value_self:
+            # value_type property: setter's self is __pyx_val_T *.
+            objstruct_cast = "struct %s *" % ext_type.objstruct_cname
+            set_type = set_entry.type
+            is_void_setter = set_type and hasattr(set_type, 'return_type') and set_type.return_type.is_void
+            self_expr = "&((%s)o)->%s" % (objstruct_cast, Naming.value_member_cname)
+            if set_type and len(set_type.args) >= 2:
+                value_arg = set_type.args[1]
+                if value_arg.type.is_extension_type:
+                    value_type_cname = value_arg.type.empty_declaration_code()
+                    call = "%s(%s, (%s)v)" % (set_entry.func_cname, self_expr, value_type_cname)
+                elif not value_arg.type.is_pyobject:
+                    value_type_cname = value_arg.type.empty_declaration_code()
+                    code.putln("    %s __pyx_v_converted_value;" % value_type_cname)
+                    if value_arg.type.create_from_py_utility_code(property_scope.global_scope()):
+                        from_py_func = value_arg.type.from_py_function
+                        code.putln("    __pyx_v_converted_value = %s(v); if (PyErr_Occurred()) return -1;" % from_py_func)
+                    else:
+                        code.putln(
+                            "    if ((__pyx_v_converted_value = (%s)PyLong_AsLong(v)) == -1 "
+                            "&& PyErr_Occurred()) return -1;" % value_type_cname)
+                    call = "%s(%s, __pyx_v_converted_value)" % (set_entry.func_cname, self_expr)
+                else:
+                    call = "%s(%s, v)" % (set_entry.func_cname, self_expr)
+            else:
+                call = "%s(%s, v)" % (set_entry.func_cname, self_expr)
+            if is_void_setter:
+                code.putln("    %s;" % call)
+                code.putln("    return 0;")
+            else:
+                code.putln("    return %s;" % call)
+        elif use_struct_cast:
             set_type = set_entry.type
             is_void_setter = set_type and hasattr(set_type, 'return_type') and set_type.return_type.is_void
             if set_type and len(set_type.args) >= 2:

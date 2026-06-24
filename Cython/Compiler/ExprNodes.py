@@ -502,6 +502,11 @@ class ExprNode(Node):
         return 0
 
     def is_addressable(self):
+        # A value-class temp is a plain C struct variable — its address can be taken
+        # (needed when chaining property access on a value_type result, e.g. self.box.size
+        # where self.box is stored in a C temp struct, not a PyObject *).
+        if self.is_temp and self.type.is_value_class:
+            return True
         return self.is_lvalue() and not self.type.is_memoryviewslice
 
     def is_ephemeral(self):
@@ -17026,6 +17031,11 @@ class CoerceToTempNode(CoercionNode):
     def may_be_none(self):
         return self.arg.may_be_none()
 
+    def is_addressable(self):
+        # A value-class temp is a plain C struct variable — its address can be taken.
+        # Same logic as CloneNode.is_addressable for value classes.
+        return self.type.is_value_class
+
     def coerce_to_boolean(self, env):
         self.arg = self.arg.coerce_to_boolean(env)
         if self.arg.is_simple():
@@ -17085,6 +17095,9 @@ class ProxyNode(CoercionNode):
 
     def result(self):
         return self.arg.result()
+
+    def is_addressable(self):
+        return self.arg.is_addressable()
 
     def is_simple(self):
         return self.arg.is_simple()
