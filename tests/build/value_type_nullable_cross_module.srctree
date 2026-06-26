@@ -178,7 +178,7 @@ ext = sysconfig.get_config_var('EXT_SUFFIX') or '.so'
 mod_a_so = 'mod_a' + ext
 if os.path.exists(mod_a_so):
     os.remove(mod_a_so)
-cmd = f'{ldshared} -O0 -I{inc} mod_a.c -o {mod_a_so}'
+cmd = f'{ldshared} {ccshared} -O0 -I{inc} mod_a.c -o {mod_a_so}'
 ret = subprocess.call(cmd, shell=True)
 if ret != 0:
     print('ERROR: failed to build mod_a', file=sys.stderr)
@@ -198,7 +198,7 @@ print(f'Compiled {mod_a_obj}')
 mod_b_so = 'mod_b' + ext
 if os.path.exists(mod_b_so):
     os.remove(mod_b_so)
-cmd = f'{ldshared} -O0 -I{inc} mod_b.c {mod_a_obj} -o {mod_b_so}'
+cmd = f'{ldshared} {ccshared} -O0 -I{inc} mod_b.c {mod_a_obj} -o {mod_b_so}'
 ret = subprocess.call(cmd, shell=True)
 if ret != 0:
     print('ERROR: failed to build mod_b', file=sys.stderr)

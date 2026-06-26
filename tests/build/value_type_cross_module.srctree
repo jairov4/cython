@@ -336,7 +336,7 @@ ext = sysconfig.get_config_var('EXT_SUFFIX') or '.so'
 mod_a_so = 'mod_a' + ext
 if os.path.exists(mod_a_so):
     os.remove(mod_a_so)
-cmd = f'{ldshared} -O0 -I{inc} mod_a.c -o {mod_a_so}'
+cmd = f'{ldshared} {ccshared} -O0 -I{inc} mod_a.c -o {mod_a_so}'
 ret = subprocess.call(cmd, shell=True)
 if ret != 0:
     print('ERROR: failed to build mod_a', file=sys.stderr)
@@ -356,7 +356,7 @@ print(f'Compiled {mod_a_obj}')
 mod_b_so = 'mod_b' + ext
 if os.path.exists(mod_b_so):
     os.remove(mod_b_so)
-cmd = f'{ldshared} -O0 -I{inc} mod_b.c {mod_a_obj} -o {mod_b_so}'
+cmd = f'{ldshared} {ccshared} -O0 -I{inc} mod_b.c {mod_a_obj} -o {mod_b_so}'
 ret = subprocess.call(cmd, shell=True)
 if ret != 0:
     print('ERROR: failed to build mod_b', file=sys.stderr)
@@ -414,7 +414,7 @@ pkg_a_c = os.path.join('pkg', 'mod_a.c')
 pkg_a_so = os.path.join('pkg', 'mod_a' + ext)
 if os.path.exists(pkg_a_so):
     os.remove(pkg_a_so)
-cmd = f'{ldshared} -O0 -I{inc} {pkg_a_c} -o {pkg_a_so}'
+cmd = f'{ldshared} {ccshared} -O0 -I{inc} {pkg_a_c} -o {pkg_a_so}'
 ret = subprocess.call(cmd, shell=True)
 if ret != 0:
     print('ERROR: failed to build pkg/mod_a', file=sys.stderr)
@@ -435,7 +435,7 @@ pkg_b_c = os.path.join('pkg', 'sub', 'mod_b.c')
 pkg_b_so = os.path.join('pkg', 'sub', 'mod_b' + ext)
 if os.path.exists(pkg_b_so):
     os.remove(pkg_b_so)
-cmd = f'{ldshared} -O0 -I{inc} {pkg_b_c} {pkg_a_obj} -o {pkg_b_so}'
+cmd = f'{ldshared} {ccshared} -O0 -I{inc} {pkg_b_c} {pkg_a_obj} -o {pkg_b_so}'
 ret = subprocess.call(cmd, shell=True)
 if ret != 0:
     print('ERROR: failed to build pkg/sub/mod_b', file=sys.stderr)

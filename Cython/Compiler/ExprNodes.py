@@ -8468,6 +8468,7 @@ class AttributeNode(ExprNode):
     is_memslice_transpose = False
     is_special_lookup = False
     is_py_attr = 0
+    _cross_module_use_vtable = False
 
     def as_cython_attribute(self):
         if (isinstance(self.obj, NameNode) and
@@ -8972,6 +8973,14 @@ class AttributeNode(ExprNode):
                 elif (entry.is_variable and not entry.fused_cfunction) or entry.is_cmethod:
                     self.type = entry.type
                     self.member = entry.cname
+                    # On Linux, __pyx_f_ symbols from a separate .so are NOT globally
+                    # visible (RTLD_LOCAL is Python's default for extension modules).
+                    # For cross-module non-LTO final methods, mark that we must fall
+                    # back to vtable dispatch instead of a direct __pyx_f_ symbol call.
+                    if (entry.is_cmethod and entry.final_func_cname
+                            and entry.defined_in_pxd
+                            and not env.directives.get('lto', False)):
+                        self._cross_module_use_vtable = True
                     return
                 else:
                     # If it's not a variable or C method, it must be a Python
@@ -9086,7 +9095,7 @@ class AttributeNode(ExprNode):
                 if self.entry.final_func_cname:
                     return self.entry.final_func_cname
             if obj.type.is_extension_type and not self.entry.is_builtin_cmethod:
-                if self.entry.final_func_cname:
+                if self.entry.final_func_cname and not self._cross_module_use_vtable:
                     return self.entry.final_func_cname
 
                 if self.type.from_fused:

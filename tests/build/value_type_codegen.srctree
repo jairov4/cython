@@ -24,6 +24,7 @@ import sys, os, sysconfig, subprocess
 
 inc = sysconfig.get_paths()['include']
 ldshared = sysconfig.get_config_var('LDSHARED') or ''
+ccshared = sysconfig.get_config_var('CCSHARED') or ''
 ext = sysconfig.get_config_var('EXT_SUFFIX') or '.so'
 
 for mod in sys.argv[1:]:
@@ -31,7 +32,7 @@ for mod in sys.argv[1:]:
     so_file = mod + ext
     if os.path.exists(so_file):
         os.remove(so_file)
-    cmd = f'{ldshared} -O0 -I{inc} {c_file} -o {so_file}'
+    cmd = f'{ldshared} {ccshared} -O0 -I{inc} {c_file} -o {so_file}'
     ret = subprocess.call(cmd, shell=True)
     if ret != 0:
         print(f'ERROR: failed to build {mod}', file=sys.stderr)
