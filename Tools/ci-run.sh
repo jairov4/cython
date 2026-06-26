@@ -124,7 +124,7 @@ export PATH="/usr/lib/ccache:$PATH"
 # Most modern compilers allow the last conflicting option
 # to override the previous ones, so '-O0 -O3' == '-O3'
 # This is true for the latest msvc, gcc and clang
-if [[ $OSTYPE == "msys" || "$OS" == "Windows_NT" ]]; then  # for MSVC cl
+if [[ $OSTYPE == "msys" ]]; then  # for MSVC cl
   # /wd disables warnings
   # 4711 warns that function `x` was selected for automatic inline expansion
   # 4127 warns that a conditional expression is constant, should be fixed here https://github.com/cython/cython/pull/4317
