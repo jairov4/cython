@@ -3309,7 +3309,7 @@ class CFuncDefNode(FuncDefNode):
 
     def _analyse_property_trampoline_declarations(self, env):
         # env is the CClassScope. The PropertyScope already has `__get__` declared as a
-        # Python function (the generator getter) — we cannot re-declare it as a C function.
+        # Python function (the generator getter) — we cannot redeclare it as a C function.
         # Strategy: create a fake cfunc Entry in env.cfunc_entries with the inherited
         # vtable slot cname, so generate_exttype_vtable_init_code fills the slot through
         # the normal method-vtable path (bypassing the broken property-scope path).

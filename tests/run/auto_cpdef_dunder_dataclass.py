@@ -40,7 +40,7 @@ def test_eq_none():
     False
     """
     a = Point(1, 2)
-    print(a == None)
+    print(a == None)  # noqa: E711
 
 
 def test_hash():

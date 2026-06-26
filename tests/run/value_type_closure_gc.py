@@ -74,9 +74,9 @@ def test_closure_cycle_is_collectable():
         return True  # GC-tracking specifics only meaningful when compiled
 
     m = Marker()
-    o = Obj(m)                      # Obj.tag -> Marker
-    fn = _make_capturing_closure(o) # closure scope embeds VT(o); scope -> o
-    m.fn = fn                       # Marker -> fn -> scope -> v.a == o -> o.tag == m  (cycle)
+    o = Obj(m)                       # Obj.tag -> Marker
+    fn = _make_capturing_closure(o)  # closure scope embeds VT(o); scope -> o
+    m.fn = fn                        # Marker -> fn -> scope -> v.a == o -> o.tag == m  (cycle)
     w = weakref.ref(m)
     del m, o, fn
     gc.collect()

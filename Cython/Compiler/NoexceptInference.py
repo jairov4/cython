@@ -494,7 +494,7 @@ class _BodyRaiseAnalysis(TreeVisitor):
         return self._node_safe(node.arg)
 
     def visit_CloneNode(self, node):
-        # CloneNode just re-uses an already-evaluated temp.
+        # CloneNode just reuses an already-evaluated temp.
         return True
 
     def visit_RawCNameExprNode(self, node):

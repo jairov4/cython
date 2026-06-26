@@ -36,7 +36,7 @@ class Vec2:
 
 def eq_none():
     a = Vec2(1, 2)
-    return a == None
+    return a == None  # noqa: E711
 
 
 def lt_none():

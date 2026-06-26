@@ -4871,7 +4871,7 @@ class OptimizeExtTypeConstructorCalls(Visitor.NodeRefCleanupMixin, Visitor.EnvTr
     def visit_SimpleCallNode(self, node):
         # Expression-level path: handles return T(args), func(T(args)),
         # obj.attr = T(args), T(args) as a standalone statement, etc.
-        # visit_SingleAssignmentNode pre-empts this for simple name-LHS assignments.
+        # visit_SingleAssignmentNode preempts this for simple name-LHS assignments.
         original_self = node.self
         self.visitchildren(node)
         # When visitchildren transforms node.self (the receiver of a method call),
