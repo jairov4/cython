@@ -47,7 +47,7 @@ class Tagged:
 @cython.final
 @cython.cclass
 @dataclass(frozen=True)
-class StrOnly:  # codespell:ignore StrOnly
+class StringOnly:
     x: cython.double
     name: str
 
@@ -204,8 +204,8 @@ def test_eq():
 
 
 def test_hash_str_field():
-    """StrOnly with str field is hashable (str is hashable)."""  # codespell:ignore StrOnly
-    v = StrOnly(1.0, "name")  # codespell:ignore StrOnly
+    """StringOnly with str field is hashable (str is hashable)."""
+    v = StringOnly(1.0, "name")
     h = hash(v)
     assert isinstance(h, int)
 
