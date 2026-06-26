@@ -20,24 +20,14 @@ main(['-f', '-X', 'infer_noexcept=True', '-X', 'language_level=3', 'vt.pyx'])
 
 ######## build_mod.py ########
 
-import sys, os, sysconfig, subprocess
+import sys
+try:
+    from setuptools import setup, Extension
+except ImportError:
+    from distutils.core import setup, Extension
 
-inc = sysconfig.get_paths()['include']
-ldshared = sysconfig.get_config_var('LDSHARED') or ''
-ccshared = sysconfig.get_config_var('CCSHARED') or ''
-ext = sysconfig.get_config_var('EXT_SUFFIX') or '.so'
-
-for mod in sys.argv[1:]:
-    c_file = mod + '.c'
-    so_file = mod + ext
-    if os.path.exists(so_file):
-        os.remove(so_file)
-    cmd = f'{ldshared} {ccshared} -O0 -I{inc} {c_file} -o {so_file}'
-    ret = subprocess.call(cmd, shell=True)
-    if ret != 0:
-        print(f'ERROR: failed to build {mod}', file=sys.stderr)
-        sys.exit(1)
-    print(f'Built {so_file}')
+exts = [Extension(mod, sources=[mod + '.c']) for mod in sys.argv[1:]]
+setup(ext_modules=exts, script_args=['build_ext', '--inplace'])
 
 ######## check_codegen.py ########
 

@@ -7,15 +7,19 @@ from Cython.Build.Dependencies import cythonize
 import Cython.Compiler.Options
 Cython.Compiler.Options.cimport_from_pyx = True
 
-from distutils.core import setup
+try:
+    from setuptools import setup
+except ImportError:
+    from distutils.core import setup
 
 setup(ext_modules=cythonize("*.pyx"))
 
 ######## provider.pyx ########
 # cython: auto_cpdef=True
 
+import os
 def open_resource(name):
-    return open("/dev/null")
+    return open(os.devnull)
 
 cpdef int process_data(str name):
     result = 0

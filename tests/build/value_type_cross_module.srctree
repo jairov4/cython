@@ -315,53 +315,23 @@ print("OK (pkg): cross-module value_type dotted-package codegen assertions passe
 
 ######## build_mods.py ########
 
+# mod_b.c uses non-static __pyx_f_ symbols from mod_a.c (value_type methods
+# have external linkage because final_func_cname suppresses 'static').
+# Including mod_a.c as a source for mod_b embeds those symbols directly in
+# mod_b's shared object, so no cross-so RTLD_LOCAL symbol lookup is needed.
 import sys
-import os
-import sysconfig
-import subprocess
+try:
+    from setuptools import setup, Extension
+except ImportError:
+    from distutils.core import setup, Extension
 
-inc = sysconfig.get_paths()['include']
-# Use LDSHARED to build each shared extension.
-ldshared = sysconfig.get_config_var('LDSHARED') or ''
-cc = sysconfig.get_config_var('CC') or 'cc'
-ccshared = sysconfig.get_config_var('CCSHARED') or ''
-ext = sysconfig.get_config_var('EXT_SUFFIX') or '.so'
-# On macOS the linker needs -undefined dynamic_lookup for unresolved
-# Python-API symbols; that flag is normally baked into LDSHARED already.
-# To let mod_b.so call non-static symbols defined in mod_a.so we compile
-# mod_a.c to a relocatable object and link it into mod_b.so directly
-# (no separate symbol-resolution step needed at dlopen time then).
-
-# ---- Step 1: build mod_a.so (for Python import) -------------------------
-mod_a_so = 'mod_a' + ext
-if os.path.exists(mod_a_so):
-    os.remove(mod_a_so)
-cmd = f'{ldshared} {ccshared} -O0 -I{inc} mod_a.c -o {mod_a_so}'
-ret = subprocess.call(cmd, shell=True)
-if ret != 0:
-    print('ERROR: failed to build mod_a', file=sys.stderr)
-    sys.exit(1)
-print(f'Built {mod_a_so}')
-
-# ---- Step 2: compile mod_a.c to a .o (for linking into mod_b) -----------
-mod_a_obj = 'mod_a_pic.o'
-cmd = f'{cc} {ccshared} -O0 -I{inc} -c mod_a.c -o {mod_a_obj}'
-ret = subprocess.call(cmd, shell=True)
-if ret != 0:
-    print('ERROR: failed to compile mod_a.c to object', file=sys.stderr)
-    sys.exit(1)
-print(f'Compiled {mod_a_obj}')
-
-# ---- Step 3: build mod_b.so linked against mod_a's object ---------------
-mod_b_so = 'mod_b' + ext
-if os.path.exists(mod_b_so):
-    os.remove(mod_b_so)
-cmd = f'{ldshared} {ccshared} -O0 -I{inc} mod_b.c {mod_a_obj} -o {mod_b_so}'
-ret = subprocess.call(cmd, shell=True)
-if ret != 0:
-    print('ERROR: failed to build mod_b', file=sys.stderr)
-    sys.exit(1)
-print(f'Built {mod_b_so}')
+setup(
+    ext_modules=[
+        Extension('mod_a', sources=['mod_a.c']),
+        Extension('mod_b', sources=['mod_b.c', 'mod_a.c']),
+    ],
+    script_args=['build_ext', '--inplace'],
+)
 
 ######## run_test.py ########
 
@@ -398,49 +368,22 @@ print("DONE: value_type cross-module tests passed (flat layout)")
 
 ######## build_pkg_mods.py ########
 
-import sys
-import os
-import sysconfig
-import subprocess
+import os, sys
+try:
+    from setuptools import setup, Extension
+except ImportError:
+    from distutils.core import setup, Extension
 
-inc = sysconfig.get_paths()['include']
-ldshared = sysconfig.get_config_var('LDSHARED') or ''
-cc = sysconfig.get_config_var('CC') or 'cc'
-ccshared = sysconfig.get_config_var('CCSHARED') or ''
-ext = sysconfig.get_config_var('EXT_SUFFIX') or '.so'
-
-# ---- Step 1: build pkg/mod_a.so -----------------------------------------
 pkg_a_c = os.path.join('pkg', 'mod_a.c')
-pkg_a_so = os.path.join('pkg', 'mod_a' + ext)
-if os.path.exists(pkg_a_so):
-    os.remove(pkg_a_so)
-cmd = f'{ldshared} {ccshared} -O0 -I{inc} {pkg_a_c} -o {pkg_a_so}'
-ret = subprocess.call(cmd, shell=True)
-if ret != 0:
-    print('ERROR: failed to build pkg/mod_a', file=sys.stderr)
-    sys.exit(1)
-print(f'Built {pkg_a_so}')
-
-# ---- Step 2: compile pkg/mod_a.c to .o (for linking into pkg/sub/mod_b) -
-pkg_a_obj = 'pkg_mod_a_pic.o'
-cmd = f'{cc} {ccshared} -O0 -I{inc} -c {pkg_a_c} -o {pkg_a_obj}'
-ret = subprocess.call(cmd, shell=True)
-if ret != 0:
-    print('ERROR: failed to compile pkg/mod_a.c to object', file=sys.stderr)
-    sys.exit(1)
-print(f'Compiled {pkg_a_obj}')
-
-# ---- Step 3: build pkg/sub/mod_b.so linked against pkg/mod_a.o ----------
 pkg_b_c = os.path.join('pkg', 'sub', 'mod_b.c')
-pkg_b_so = os.path.join('pkg', 'sub', 'mod_b' + ext)
-if os.path.exists(pkg_b_so):
-    os.remove(pkg_b_so)
-cmd = f'{ldshared} {ccshared} -O0 -I{inc} {pkg_b_c} {pkg_a_obj} -o {pkg_b_so}'
-ret = subprocess.call(cmd, shell=True)
-if ret != 0:
-    print('ERROR: failed to build pkg/sub/mod_b', file=sys.stderr)
-    sys.exit(1)
-print(f'Built {pkg_b_so}')
+
+setup(
+    ext_modules=[
+        Extension('pkg.mod_a', sources=[pkg_a_c]),
+        Extension('pkg.sub.mod_b', sources=[pkg_b_c, pkg_a_c]),
+    ],
+    script_args=['build_ext', '--inplace'],
+)
 
 ######## run_pkg_test.py ########
 

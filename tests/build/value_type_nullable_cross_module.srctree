@@ -164,46 +164,18 @@ print("OK: cross-module nullable value_type codegen assertions passed")
 ######## build_mods.py ########
 
 import sys
-import os
-import sysconfig
-import subprocess
+try:
+    from setuptools import setup, Extension
+except ImportError:
+    from distutils.core import setup, Extension
 
-inc = sysconfig.get_paths()['include']
-ldshared = sysconfig.get_config_var('LDSHARED') or ''
-cc = sysconfig.get_config_var('CC') or 'cc'
-ccshared = sysconfig.get_config_var('CCSHARED') or ''
-ext = sysconfig.get_config_var('EXT_SUFFIX') or '.so'
-
-# Step 1: build mod_a.so
-mod_a_so = 'mod_a' + ext
-if os.path.exists(mod_a_so):
-    os.remove(mod_a_so)
-cmd = f'{ldshared} {ccshared} -O0 -I{inc} mod_a.c -o {mod_a_so}'
-ret = subprocess.call(cmd, shell=True)
-if ret != 0:
-    print('ERROR: failed to build mod_a', file=sys.stderr)
-    sys.exit(1)
-print(f'Built {mod_a_so}')
-
-# Step 2: compile mod_a.c to .o (for linking into mod_b)
-mod_a_obj = 'mod_a_pic.o'
-cmd = f'{cc} {ccshared} -O0 -I{inc} -c mod_a.c -o {mod_a_obj}'
-ret = subprocess.call(cmd, shell=True)
-if ret != 0:
-    print('ERROR: failed to compile mod_a.c to object', file=sys.stderr)
-    sys.exit(1)
-print(f'Compiled {mod_a_obj}')
-
-# Step 3: build mod_b.so linked against mod_a object
-mod_b_so = 'mod_b' + ext
-if os.path.exists(mod_b_so):
-    os.remove(mod_b_so)
-cmd = f'{ldshared} {ccshared} -O0 -I{inc} mod_b.c {mod_a_obj} -o {mod_b_so}'
-ret = subprocess.call(cmd, shell=True)
-if ret != 0:
-    print('ERROR: failed to build mod_b', file=sys.stderr)
-    sys.exit(1)
-print(f'Built {mod_b_so}')
+setup(
+    ext_modules=[
+        Extension('mod_a', sources=['mod_a.c']),
+        Extension('mod_b', sources=['mod_b.c', 'mod_a.c']),
+    ],
+    script_args=['build_ext', '--inplace'],
+)
 
 ######## run_test.py ########
 
