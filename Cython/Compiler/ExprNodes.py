@@ -8973,27 +8973,16 @@ class AttributeNode(ExprNode):
                 elif (entry.is_variable and not entry.fused_cfunction) or entry.is_cmethod:
                     self.type = entry.type
                     self.member = entry.cname
-                    # On Linux, __pyx_f_ symbols from a separately-compiled .so are NOT
-                    # globally visible (RTLD_LOCAL is Python's default dlopen flag).
-                    # For cross-module final methods compiled independently (not in the
-                    # same compile_multiple batch), fall back to vtable dispatch so the
-                    # generated .so doesn't have an unresolvable undefined symbol.
-                    # compile_multiple batches (compilation_sources non-empty and
-                    # containing the provider) are compiled together and are expected to
-                    # be linked appropriately, so direct calls remain valid there.
+                    # On Linux, __pyx_f_ symbols from a different .so are NOT globally
+                    # visible (RTLD_LOCAL is Python's default dlopen flag). Without LTO
+                    # (which links modules into a single unit), a direct __pyx_f_ symbol
+                    # reference in a.so to b.so will be unresolvable at dlopen time.
+                    # Fall back to vtable dispatch, which resolves through the already-
+                    # loaded __pyx_vtab pointer in the object — always safe across .so files.
                     if (entry.is_cmethod and entry.final_func_cname
                             and entry.defined_in_pxd
                             and not env.directives.get('lto', False)):
-                        compilation_sources = env.global_scope().compilation_sources
-                        provider_in_batch = False
-                        if compilation_sources:
-                            provider_scope = entry.scope
-                            while provider_scope and not provider_scope.is_module_scope:
-                                provider_scope = provider_scope.outer_scope
-                            if provider_scope and provider_scope.qualified_name in compilation_sources:
-                                provider_in_batch = True
-                        if not provider_in_batch:
-                            self._cross_module_use_vtable = True
+                        self._cross_module_use_vtable = True
                     return
                 else:
                     # If it's not a variable or C method, it must be a Python
