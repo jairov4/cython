@@ -8979,10 +8979,16 @@ class AttributeNode(ExprNode):
                     # reference in a.so to b.so will be unresolvable at dlopen time.
                     # Fall back to vtable dispatch, which resolves through the already-
                     # loaded __pyx_vtab pointer in the object — always safe across .so files.
+                    # NOTE: entry.defined_in_pxd is only set on module-scope entries, not
+                    # on method entries inside a cimported class scope, so we detect
+                    # cross-module use by comparing the method's module scope to ours.
                     if (entry.is_cmethod and entry.final_func_cname
-                            and entry.defined_in_pxd
                             and not env.directives.get('lto', False)):
-                        self._cross_module_use_vtable = True
+                        provider_scope = entry.scope
+                        while provider_scope and not provider_scope.is_module_scope:
+                            provider_scope = provider_scope.outer_scope
+                        if provider_scope is not None and provider_scope is not env.global_scope():
+                            self._cross_module_use_vtable = True
                     return
                 else:
                     # If it's not a variable or C method, it must be a Python
