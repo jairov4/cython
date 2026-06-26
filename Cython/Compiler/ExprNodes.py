@@ -10862,7 +10862,7 @@ class DictNode(ExprNode):
                 if self.type.is_value_class and self.type.needs_refcounting:
                     mtype = member.type
                     if mtype.is_pyobject:
-                        code.putln("Py_XINCREF(%s.%s);" % (self.result(), key_cname))
+                        code.putln("Py_XINCREF((PyObject *)%s.%s);" % (self.result(), key_cname))
                     elif mtype.is_value_class and mtype.needs_refcounting:
                         code.putln("%s(&%s.%s);" % (
                             mtype._refcount_incref_fname, self.result(), key_cname))

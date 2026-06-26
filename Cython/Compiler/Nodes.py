@@ -7311,14 +7311,23 @@ class CClassDefNode(ClassDefNode):
             if not getattr(scope, 'python_subclassing', True):
                 # Mark this type so that permissive __init_subclass__ overrides in
                 # subclasses can skip it when walking the MRO for super() propagation.
-                # Use PyDict_SetItemString+PyType_Modified rather than
-                # PyObject_SetAttrString because non-heap (static) types reject the
-                # latter with "cannot set attribute of immutable type".
+                # Under non-Limited API: PyDict_SetItemString+PyType_Modified is used
+                # rather than PyObject_SetAttrString because non-heap (static) types
+                # reject the latter with "cannot set attribute of immutable type".
+                # Under Limited API: CYTHON_USE_TYPE_SPECS is always set so types are
+                # heap types; PyObject_SetAttrString works and PyTypeObject is opaque.
+                code.putln('#if CYTHON_COMPILING_IN_LIMITED_API')
+                code.put_error_if_neg(
+                    entry.pos,
+                    'PyObject_SetAttrString((PyObject *)(%s), '
+                    '"__pyx_blocking_init_subclass__", Py_True)' % typeptr_cname)
+                code.putln('#else')
                 code.put_error_if_neg(
                     entry.pos,
                     'PyDict_SetItemString(((PyTypeObject *)(%s))->tp_dict, '
                     '"__pyx_blocking_init_subclass__", Py_True)' % typeptr_cname)
                 code.putln('PyType_Modified((PyTypeObject *)(%s));' % typeptr_cname)
+                code.putln('#endif')
 
             weakref_entry = scope.lookup_here("__weakref__") if not scope.is_closure_class_scope else None
             if weakref_entry:

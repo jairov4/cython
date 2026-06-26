@@ -1706,9 +1706,15 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         code.putln("static %s %s(PyObject *o) {" % (valstruct, value_type.from_py_function))
         code.putln("%s r;" % valstruct)
         code.putln("if (unlikely(Py_TYPE(o) != (PyTypeObject *)%s)) {" % typeptr)
+        code.putln("#if CYTHON_COMPILING_IN_LIMITED_API")
+        code.putln("PyErr_Format(PyExc_TypeError, "
+                   "\"Expected an exact instance of '%s', got %%S\", "
+                   "Py_TYPE(o));" % value_type.py_name)
+        code.putln("#else")
         code.putln("PyErr_Format(PyExc_TypeError, "
                    "\"Expected an exact instance of '%s', got %%.200s\", "
                    "Py_TYPE(o)->tp_name);" % value_type.py_name)
+        code.putln("#endif")
         code.putln("memset(&r, 0, sizeof(r));")
         code.putln("return r;")
         code.putln("}")
@@ -1780,7 +1786,7 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         for f in value_type.scope.var_entries:
             ftype = f.type
             if ftype.is_pyobject:
-                code.putln("Py_XINCREF(v->%s);" % f.cname)
+                code.putln("Py_XINCREF((PyObject *)v->%s);" % f.cname)
             elif ftype.is_value_class and ftype.needs_refcounting:
                 code.putln("%s(&v->%s);" % (ftype._refcount_incref_fname, f.cname))
             elif ftype.is_nullable_value and ftype.needs_refcounting:
@@ -1795,7 +1801,7 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
         for f in value_type.scope.var_entries:
             ftype = f.type
             if ftype.is_pyobject:
-                code.putln("Py_XDECREF(v->%s);" % f.cname)
+                code.putln("Py_XDECREF((PyObject *)v->%s);" % f.cname)
             elif ftype.is_value_class and ftype.needs_refcounting:
                 code.putln("%s(&v->%s);" % (ftype._refcount_decref_fname, f.cname))
             elif ftype.is_nullable_value and ftype.needs_refcounting:
@@ -3595,17 +3601,26 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             code.putln("     then call super(last_skipped, cls).__init_subclass__(**kwds). */")
             code.putln("  PyObject *__pyx_super_from = (PyObject *)(%s);" % typeptr_expr)
             code.putln("  if (__pyx_super_from) {")
-            code.putln("    PyObject *__pyx_mro = ((PyTypeObject*)cls)->tp_mro;")
-            code.putln("    Py_ssize_t __pyx_i, __pyx_n = PyTuple_GET_SIZE(__pyx_mro);")
+            code.putln("    PyObject *__pyx_mro;")
+            code.putln("#if CYTHON_COMPILING_IN_LIMITED_API")
+            code.putln("    __pyx_mro = PyObject_GetAttrString(cls, \"__mro__\");")
+            code.putln("    if (!__pyx_mro) return NULL;")
+            code.putln("#else")
+            code.putln("    __pyx_mro = ((PyTypeObject*)cls)->tp_mro;")
+            code.putln("#endif")
+            code.putln("    Py_ssize_t __pyx_i, __pyx_n = __Pyx_PyTuple_GET_SIZE(__pyx_mro);")
             code.putln("    for (__pyx_i = 0; __pyx_i < __pyx_n; __pyx_i++) {")
-            code.putln("      if (PyTuple_GET_ITEM(__pyx_mro, __pyx_i) == __pyx_super_from)")
+            code.putln("      if (__Pyx_PyTuple_GET_ITEM(__pyx_mro, __pyx_i) == __pyx_super_from)")
             code.putln("        { __pyx_i++; break; }")
             code.putln("    }")
             code.putln("    for (; __pyx_i < __pyx_n; __pyx_i++) {")
-            code.putln("      PyObject *__pyx_b = PyTuple_GET_ITEM(__pyx_mro, __pyx_i);")
+            code.putln("      PyObject *__pyx_b = __Pyx_PyTuple_GET_ITEM(__pyx_mro, __pyx_i);")
             code.putln('      if (PyObject_HasAttrString(__pyx_b, "__pyx_blocking_init_subclass__"))')
             code.putln("        __pyx_super_from = __pyx_b;")
             code.putln("    }")
+            code.putln("#if CYTHON_COMPILING_IN_LIMITED_API")
+            code.putln("    Py_DECREF(__pyx_mro); /* new ref from PyObject_GetAttrString */")
+            code.putln("#endif")
             code.putln("    {")
             code.putln("      PyObject *__pyx_super = PyObject_CallFunctionObjArgs(")
             code.putln("          (PyObject *)&PySuper_Type, __pyx_super_from, cls, NULL);")
@@ -3627,16 +3642,31 @@ class ModuleNode(Nodes.Node, Nodes.BlockNode):
             code.putln("  }")
             code.putln("  Py_RETURN_NONE;")
         else:
+            code.putln("#if CYTHON_COMPILING_IN_LIMITED_API && PY_VERSION_HEX >= 0x030c0000")
+            code.putln("  /* Python 3.12+ limited API: PyTypeObject is opaque; use flags.")
+            code.putln("     Py_TPFLAGS_MANAGED_DICT=(1<<4) is set by type.__new__, not PyType_FromSpec. */")
+            code.putln("  int __pyx_is_python_class = (PyType_GetFlags((PyTypeObject*)cls) & (1 << 4)) != 0;")
+            code.putln("#elif CYTHON_COMPILING_IN_LIMITED_API")
+            code.putln("  int __pyx_is_python_class = 0;  /* 3.9-3.11 limited API: cannot distinguish */")
+            code.putln("#else")
             code.putln("  int __pyx_is_python_class = (((PyTypeObject*)cls)->tp_dictoffset != 0);")
-            code.putln("#ifdef Py_TPFLAGS_MANAGED_DICT")
+            code.putln("#  ifdef Py_TPFLAGS_MANAGED_DICT")
             code.putln("  __pyx_is_python_class = __pyx_is_python_class ||")
             code.putln("      __Pyx_PyType_HasFeature((PyTypeObject*)cls, Py_TPFLAGS_MANAGED_DICT);")
+            code.putln("#  endif")
             code.putln("#endif")
             code.putln("  if (__pyx_is_python_class) {")
+            code.putln("#if CYTHON_COMPILING_IN_LIMITED_API")
+            code.putln('    PyErr_Format(PyExc_TypeError,')
+            code.putln('        "type \'%S\' does not support subclassing by pure Python classes"')
+            code.putln('        " (python_subclassing=False)",')
+            code.putln('        cls);')
+            code.putln("#else")
             code.putln('    PyErr_Format(PyExc_TypeError,')
             code.putln('        "type \'%s\' does not support subclassing by pure Python classes"')
             code.putln('        " (python_subclassing=False)",')
             code.putln('        ((PyTypeObject*)cls)->tp_name);')
+            code.putln("#endif")
             code.putln("    return NULL;")
             code.putln("  }")
             code.putln("  Py_RETURN_NONE;")

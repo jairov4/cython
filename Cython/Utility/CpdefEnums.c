@@ -42,8 +42,10 @@ PyObject *{{funcname}}({{enum_type}} __pyx_v_c_val) {
 {{if is_flag}}
     // Flag enum: return the Python IntFlag for this combination of bits
     {
-        PyObject *__pyx_r2 = PyObject_CallOneArg(__pyx_v___pyx_enum,
-                                                  PyLong_FromLong((long)__pyx_v_c_val));
+        PyObject *__pyx_arg = PyLong_FromLong((long)__pyx_v_c_val);
+        PyObject *__pyx_r2 = likely(__pyx_arg) ?
+            PyObject_CallFunctionObjArgs(__pyx_v___pyx_enum, __pyx_arg, NULL) : NULL;
+        Py_XDECREF(__pyx_arg);
         Py_DECREF(__pyx_v___pyx_enum);
         return __pyx_r2;
     }
@@ -98,8 +100,10 @@ static PyObject *{{funcname}}({{enum_type}} __pyx_v_c_val) {
 {{if is_flag}}
     // Flag enum: return the Python IntFlag for this combination of bits
     {
-        PyObject *__pyx_r2 = PyObject_CallOneArg(__pyx_v___pyx_enum,
-                                                  PyLong_FromLong((long)__pyx_v_c_val));
+        PyObject *__pyx_arg = PyLong_FromLong((long)__pyx_v_c_val);
+        PyObject *__pyx_r2 = likely(__pyx_arg) ?
+            PyObject_CallFunctionObjArgs(__pyx_v___pyx_enum, __pyx_arg, NULL) : NULL;
+        Py_XDECREF(__pyx_arg);
         Py_DECREF(__pyx_v___pyx_enum);
         return __pyx_r2;
     }
