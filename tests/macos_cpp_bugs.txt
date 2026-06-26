@@ -1,3 +1,4 @@
+# all of this tests works with clang but not with Apple Clang due lack of support
 complex_numbers_T305
 complex_numbers_c99_T398
 complex_numbers_cpp
@@ -14,7 +15,9 @@ cpp_stl_algo_sorted_ranges_set_ops
 cpp_stl_algo_sorted_ranges_other_ops
 cpp_stl_bit_cpp20
 cpp_stl_cmath_cpp20
-cpp_stl_cmath_cpp17
 libcpp_threadsync_cpp20
 libcpp_stop_token
 cpp_condition_variables_cpp20
+
+# not working in macOS due lack of legendre and others
+cpp_stl_cmath_cpp17

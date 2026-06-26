@@ -324,7 +324,7 @@ inc = sysconfig.get_paths()['include']
 # Use LDSHARED to build each shared extension.
 ldshared = sysconfig.get_config_var('LDSHARED') or ''
 cc = sysconfig.get_config_var('CC') or 'cc'
-ccshared = sysconfig.get_config_var('CCSHARED') or '-fPIC'
+ccshared = sysconfig.get_config_var('CCSHARED') or ''
 ext = sysconfig.get_config_var('EXT_SUFFIX') or '.so'
 # On macOS the linker needs -undefined dynamic_lookup for unresolved
 # Python-API symbols; that flag is normally baked into LDSHARED already.
@@ -406,7 +406,7 @@ import subprocess
 inc = sysconfig.get_paths()['include']
 ldshared = sysconfig.get_config_var('LDSHARED') or ''
 cc = sysconfig.get_config_var('CC') or 'cc'
-ccshared = sysconfig.get_config_var('CCSHARED') or '-fPIC'
+ccshared = sysconfig.get_config_var('CCSHARED') or ''
 ext = sysconfig.get_config_var('EXT_SUFFIX') or '.so'
 
 # ---- Step 1: build pkg/mod_a.so -----------------------------------------
