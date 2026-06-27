@@ -314,6 +314,11 @@ def main(args):
     app_name, *c_files = args
     c_base_names = [Path(filename).stem for filename in c_files]
 
+    is_cpp = any(f.endswith('.cpp') for f in c_files)
+    if is_cpp and not IS_WINDOWS:
+        cxx = os.environ.get('CXX', 'c++').split()[0]
+        ccompiler.linker_exe = [cxx]
+
     print("CFLAGS:", CFLAGS)
     print(f"PYLIBS: {PYLIB!r} {PYLIB_DYN!r}")
     print(f"LINK: {LIBDIR1!r} {LIBDIR2!r}")

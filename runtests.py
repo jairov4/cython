@@ -1647,7 +1647,14 @@ class CythonRunTestCase(CythonCompileTestCase):
                     module = import_ext(module_or_name, ext_so_path)
             else:
                 module = module_or_name
-            tests = doctest.DocTestSuite(module)
+            try:
+                tests = doctest.DocTestSuite(module)
+            except ValueError:
+                # PyPy >= 3.11 raises ValueError('object must be a class or function')
+                # when encountering Cython-compiled descriptors during module scan.
+                # Fall back to non-recursive discovery which still finds module-level doctests.
+                finder = doctest.DocTestFinder(recurse=False)
+                tests = doctest.DocTestSuite(module, test_finder=finder)
             if self.test_selector:
                 filter_test_suite(tests, self.test_selector)
             with self.stats.time(self.name, self.language, 'run'):
