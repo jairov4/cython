@@ -165,5 +165,8 @@ def test_no_copy_args(func, **kw):
     We test that no copy is made of the args tuple.
     This tests both the caller side and the callee side.
     """
+    import sys
+    if sys.implementation.name != 'cpython':
+        return True  # tuple passthrough is a CPython FASTCALL optimization
     args = (1, 2, 3)
     return func(*args, **kw) is args
