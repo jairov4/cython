@@ -13,6 +13,8 @@ import sys
 from dataclasses import dataclass
 from typing import Optional
 
+_CPYTHON = sys.implementation.name == 'cpython'
+
 
 @cython.cclass
 class Wrapper:
@@ -80,8 +82,8 @@ def test_copy_refcount():
     Refcounts rise and fall correctly with copies.
     Uses explicit type annotations so Cython uses value semantics (not boxing).
     """
-    if not cython.compiled:
-        return  # refcount tests require Cython value-copy semantics
+    if not cython.compiled or not _CPYTHON:
+        return  # refcount tests require Cython value-copy semantics on CPython
     obj = object()
     base_rc = _rc(obj)
 
@@ -100,8 +102,8 @@ def test_copy_refcount():
 
 def test_reassignment_refcount():
     """Reassigning a value variable decrefs the old value and increfs the new."""
-    if not cython.compiled:
-        return  # refcount tests require Cython value-copy semantics
+    if not cython.compiled or not _CPYTHON:
+        return  # refcount tests require Cython value-copy semantics on CPython
     obj1 = object()
     obj2 = object()
     base1 = _rc(obj1)
@@ -121,8 +123,8 @@ def test_reassignment_refcount():
 
 def test_del_refcount():
     """del v releases the reference held by the value struct."""
-    if not cython.compiled:
-        return  # refcount tests require Cython value-copy semantics
+    if not cython.compiled or not _CPYTHON:
+        return  # refcount tests require Cython value-copy semantics on CPython
     obj = object()
     base = _rc(obj)
 
@@ -135,8 +137,8 @@ def test_del_refcount():
 
 def test_boxing_refcount():
     """Boxing a value class (to Python object) creates an independent copy."""
-    if not cython.compiled:
-        return  # refcount tests require Cython value-copy semantics
+    if not cython.compiled or not _CPYTHON:
+        return  # refcount tests require Cython value-copy semantics on CPython
     obj = object()
     base = _rc(obj)
 
@@ -155,8 +157,8 @@ def test_boxing_refcount():
 
 def test_unboxing_refcount():
     """Unboxing (from Python object) gives the value independent ownership."""
-    if not cython.compiled:
-        return  # refcount tests require Cython value-copy semantics
+    if not cython.compiled or not _CPYTHON:
+        return  # refcount tests require Cython value-copy semantics on CPython
     obj = object()
     base = _rc(obj)
 
@@ -222,6 +224,8 @@ def test_hash_list_field_raises():
 
 def test_none_field():
     """Object fields can be None."""
+    if not _CPYTHON:
+        return
     v: Tagged = Tagged(0.0, "x", None)
     assert v.payload is None
     obj = object()
@@ -234,8 +238,8 @@ def test_none_field():
 
 def test_scope_exit_refcount():
     """Refcounts return to baseline after value leaves scope."""
-    if not cython.compiled:
-        return  # refcount tests require Cython value-copy semantics
+    if not cython.compiled or not _CPYTHON:
+        return  # refcount tests require Cython value-copy semantics on CPython
     obj = object()
     base = _rc(obj)
 
@@ -250,8 +254,8 @@ def test_scope_exit_refcount():
 
 def test_repeated_construction_no_leak():
     """Repeated construction/destruction of value with object field doesn't leak."""
-    if not cython.compiled:
-        return  # refcount tests require Cython value-copy semantics
+    if not cython.compiled or not _CPYTHON:
+        return  # refcount tests require Cython value-copy semantics on CPython
     obj = object()
     base = _rc(obj)
     N = 10000
@@ -263,8 +267,8 @@ def test_repeated_construction_no_leak():
 
 def test_list_field_refcount():
     """list field refcounting works correctly."""
-    if not cython.compiled:
-        return  # refcount tests require Cython value-copy semantics
+    if not cython.compiled or not _CPYTHON:
+        return  # refcount tests require Cython value-copy semantics on CPython
     lst = [1, 2, 3]
     base = _rc(lst)
 
@@ -310,7 +314,7 @@ def test_cclass_typed_field_none():
 
 def test_cclass_typed_field_refcount():
     """Cclass-typed field in a value type is refcounted correctly."""
-    if not cython.compiled:
+    if not cython.compiled or not _CPYTHON:
         return
     w = Wrapper(7)
     base = _rc(w)
@@ -336,7 +340,7 @@ class Container:
 
 def test_attribute_assignment_refcount():
     """Assigning a refcounted value type to a cclass attribute INCs/DECREFs correctly."""
-    if not cython.compiled:
+    if not cython.compiled or not _CPYTHON:
         return
     obj1 = object()
     obj2 = object()

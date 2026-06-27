@@ -251,6 +251,7 @@ KNOWN_PYTHON_BUILTINS = frozenset([
     'reversed',
     'round',
     'set',
+    'sentinel',
     'setattr',
     'slice',
     'sorted',

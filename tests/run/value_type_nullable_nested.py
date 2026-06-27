@@ -18,6 +18,8 @@ import cython
 import sys
 from cython import cclass, final, value_type, double
 from dataclasses import dataclass
+
+_CPYTHON = sys.implementation.name == 'cpython'
 from typing import Optional
 
 
@@ -182,7 +184,7 @@ def test_with_opt_obj_some():
 
 def test_with_opt_obj_refcount():
     """Refcount of Sentinel payload tracked through WithOptObj."""
-    if not cython.compiled:
+    if not cython.compiled or not _CPYTHON:
         return
 
     s = Sentinel(7)

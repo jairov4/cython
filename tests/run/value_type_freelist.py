@@ -13,6 +13,7 @@ import cython
 import sys
 from dataclasses import dataclass
 
+_CPYTHON = sys.implementation.name == 'cpython'
 
 @cython.cclass
 class Obj:
@@ -83,8 +84,8 @@ def test_vt_freelist_refcount():
     >>> test_vt_freelist_refcount()
     True
     """
-    if not cython.compiled:
-        return True   # refcount assertion only meaningful in compiled mode
+    if not cython.compiled or not _CPYTHON:
+        return True   # refcount assertion only meaningful in compiled CPython
     o1 = Obj(1)
     o2 = Obj(2)
     base1 = _rc(o1)
@@ -121,7 +122,7 @@ def test_outer_freelist_refcount():
     >>> test_outer_freelist_refcount()
     True
     """
-    if not cython.compiled:
+    if not cython.compiled or not _CPYTHON:
         return True
     o = Obj(42)
     base = _rc(o)
@@ -160,7 +161,7 @@ def test_nullable_vt_assignment_refcount():
     >>> test_nullable_vt_assignment_refcount()
     True
     """
-    if not cython.compiled:
+    if not cython.compiled or not _CPYTHON:
         return True
     o1 = Obj(1)
     o2 = Obj(2)
@@ -183,7 +184,7 @@ def test_nullable_vt_loop_reassign_refcount():
     >>> test_nullable_vt_loop_reassign_refcount()
     True
     """
-    if not cython.compiled:
+    if not cython.compiled or not _CPYTHON:
         return True
     o1 = Obj(1)
     o2 = Obj(2)

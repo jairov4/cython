@@ -14,8 +14,11 @@ cclass field was captured by a lambda held alive by a generator.
 
 import cython
 import gc
+import sys
 import weakref
 from dataclasses import dataclass
+
+_CPYTHON = sys.implementation.name == 'cpython'
 
 
 @cython.cclass
@@ -70,8 +73,8 @@ def test_closure_cycle_is_collectable():
     must be collectable.  If the closure scope lacks tp_traverse/tp_clear for
     the embedded PyObject field, the cycle leaks (uncollectable).
     """
-    if not cython.compiled:
-        return True  # GC-tracking specifics only meaningful when compiled
+    if not cython.compiled or not _CPYTHON:
+        return True  # GC-tracking specifics only meaningful when compiled on CPython
 
     m = Marker()
     o = Obj(m)                       # Obj.tag -> Marker

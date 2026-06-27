@@ -189,7 +189,7 @@ def some_ne_diff():
 
 @cython.cclass
 class Container:
-    cached: Size | None
+    cached: Optional[Size]
 
     def __init__(self, w: double, h: double, is_none: cython.bint):
         if is_none:
@@ -203,7 +203,7 @@ class Container:
     def ne_value(self, v: Size) -> cython.bint:
         return self.cached != v
 
-    def eq_nullable(self, other: Size | None) -> cython.bint:
+    def eq_nullable(self, other: Optional[Size]) -> cython.bint:
         return self.cached == other
 
 
@@ -249,7 +249,7 @@ def test_cclass_nullable_eq_nullable_both_none():
     True
     """
     c = Container(0.0, 0.0, True)
-    other: Size | None = None
+    other: Optional[Size] = None
     return c.eq_nullable(other)
 
 
@@ -259,7 +259,7 @@ def test_cclass_nullable_eq_nullable_some_same():
     True
     """
     c = Container(3.0, 4.0, False)
-    other: Size | None = Size(3.0, 4.0)
+    other: Optional[Size] = Size(3.0, 4.0)
     return c.eq_nullable(other)
 
 
@@ -269,5 +269,5 @@ def test_cclass_nullable_eq_nullable_some_diff():
     False
     """
     c = Container(3.0, 4.0, False)
-    other: Size | None = Size(1.0, 2.0)
+    other: Optional[Size] = Size(1.0, 2.0)
     return c.eq_nullable(other)
