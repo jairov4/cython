@@ -2074,6 +2074,7 @@ class FuncDefNode(StatNode, BlockNode):
     is_cyfunction = False
     code_object = None
     return_type_annotation = None
+    use_pycfunction_check = False  # set True by _MinimalPyFuncRef for cross-module trampolines
 
     outer_attrs = None  # overridden by some derived classes - to be visited outside the node's scope
 
@@ -3457,12 +3458,14 @@ class CFuncDefNode(FuncDefNode):
                  for a in inh_type.args[1:]]
         cfunc_type = PyrexTypes.CFuncType(
             inh_type.return_type, args,
-            has_varargs=False,
+            has_varargs=inh_type.has_varargs,
             exception_value=inh_type.exception_value,
             exception_check=inh_type.exception_check,
             calling_convention=inh_type.calling_convention,
             nogil=inh_type.nogil, with_gil=inh_type.with_gil,
-            is_overridable=True)
+            is_overridable=True,
+            optional_arg_count=inh_type.optional_arg_count)
+        cfunc_type.op_arg_struct = inh_type.op_arg_struct
         self.type = cfunc_type
         self.return_type = cfunc_type.return_type
 
@@ -3490,23 +3493,27 @@ class CFuncDefNode(FuncDefNode):
 
         # Walk up to find the first class that DEFINES (not inherits) this method;
         # we call through its vtabptr to avoid re-entering our own trampoline.
-        # Use func_cname as the "defined here" indicator: declare_inherited_c_attributes
-        # never sets func_cname; declare_cfunction with defining=True does, even when it
-        # updates an existing inherited entry in-place (is_inherited stays True in that case).
+        # Two indicators for "defined in this class":
+        #   - not e.is_inherited: freshly declared here (covers pxd-only declarations)
+        #   - e.func_cname: re-declared with same signature — declare_cfunction(defining=True)
+        #     sets func_cname on the existing inherited entry without clearing is_inherited
         defining_base_type = env.parent_type.base_type
         defining_entry = inherited_entry  # fallback
         while defining_base_type and defining_base_type.scope:
             e = defining_base_type.scope.lookup(name)
-            if e and e.func_cname:
+            if e and (not e.is_inherited or e.func_cname):
                 defining_entry = e
                 break
             defining_base_type = defining_base_type.base_type
 
-        # OverrideCheckNode: use the inherited Python-wrapper Entry as py_func proxy.
-        # The comparison is against Base's __pyx_pw_ function; Python overrides in
-        # subclasses of Derived will differ from that → dispatch fires correctly.
-        py_wrapper_entry = inherited_entry.as_variable or (defining_entry.as_variable if defining_entry else None)
-        fake_py_func = _MinimalPyFuncRef(py_wrapper_entry)
+        # OverrideCheckNode: use the trampoline's own entry (for scope/name info).
+        # The trampoline has no local __pyx_pw_ Python wrapper, so we can't use
+        # __Pyx_IsSameCFunction against the base class wrapper (it is static in another
+        # .cpp file).  Instead set use_pycfunction_check=True: the generated check uses
+        # !PyCFunction_Check(func) to detect pure-Python overrides at runtime.  This is
+        # correct because Python def-overrides are not CFunction objects, while Cython
+        # subclasses update their own vtable slot and never call through this trampoline.
+        fake_py_func = _MinimalPyFuncRef(self.entry, use_pycfunction_check=True)
         self.override = OverrideCheckNode(self.pos, py_func=fake_py_func)
         self.body = StatListNode(
             self.pos,
@@ -3671,6 +3678,21 @@ class CFuncDefNode(FuncDefNode):
 
     def generate_argument_declarations(self, env, code):
         scope = self.local_scope
+        if self.trampoline_inherited_entry is not None and self.type.optional_arg_count:
+            # Inheritance trampolines bypass the normal CArgDeclNode path:
+            # args have no `default` set because we don't have the original
+            # default expressions from the base module.  Declare optional-arg
+            # local variables zero-initialised; the unpacking code below fills
+            # them from __pyx_optional_args when the caller supplies a value.
+            opt_start = len(self.type.args) - self.type.optional_arg_count
+            for ta in self.type.args[opt_start:]:
+                entry = scope.lookup(ta.name)
+                if entry and (self.override or entry.cf_used):
+                    # Use cast_code('0') to handle enum types in C++ mode.
+                    code.putln('%s = %s;' % (
+                        ta.type.declaration_code(entry.cname),
+                        ta.type.cast_code('0')))
+            return
         for arg in self.args:
             if arg.default:
                 entry = scope.lookup(arg.name)
@@ -3687,21 +3709,35 @@ class CFuncDefNode(FuncDefNode):
         scope = self.local_scope
         if self.type.optional_arg_count:
             code.putln('if (%s) {' % Naming.optional_args_cname)
-            for arg in self.args:
-                if arg.default:
-                    entry = scope.lookup(arg.name)
-                    if self.override or entry.cf_used:
-                        code.putln('if (%s->%sn & (1U << %s)) {' %
-                                   (Naming.optional_args_cname,
-                                    Naming.pyrex_prefix, i))
-                        declarator = arg.declarator
-                        while not hasattr(declarator, 'name'):
-                            declarator = declarator.base
-                        code.putln('%s = %s->%s;' %
-                                   (arg.cname, Naming.optional_args_cname,
-                                    self.type.opt_arg_cname(declarator.name)))
+            if self.trampoline_inherited_entry is not None:
+                # Inheritance trampoline: unpack optional args from the struct
+                # using type.args directly (no CArgDeclNode defaults available).
+                opt_start = len(self.type.args) - self.type.optional_arg_count
+                for j, ta in enumerate(self.type.args[opt_start:]):
+                    entry = scope.lookup(ta.name)
+                    if entry and (self.override or entry.cf_used):
+                        code.putln('if (%s->%sn & (1U << %s)) {' % (
+                            Naming.optional_args_cname, Naming.pyrex_prefix, j))
+                        code.putln('%s = %s->%s;' % (
+                            entry.cname, Naming.optional_args_cname,
+                            self.type.opt_arg_cname(ta.name)))
                         code.putln('}')
-                    i += 1
+            else:
+                for arg in self.args:
+                    if arg.default:
+                        entry = scope.lookup(arg.name)
+                        if self.override or entry.cf_used:
+                            code.putln('if (%s->%sn & (1U << %s)) {' %
+                                       (Naming.optional_args_cname,
+                                        Naming.pyrex_prefix, i))
+                            declarator = arg.declarator
+                            while not hasattr(declarator, 'name'):
+                                declarator = declarator.base
+                            code.putln('%s = %s->%s;' %
+                                       (arg.cname, Naming.optional_args_cname,
+                                        self.type.opt_arg_cname(declarator.name)))
+                            code.putln('}')
+                        i += 1
             code.putln('}')
 
         # Move arguments into closure if required
@@ -5887,12 +5923,22 @@ class _MinimalPyFuncRef:
     .fused_py_func (checked for fused dispatch), and .is_module_scope (selects self arg).
     For synthesised inheritance trampolines there is no DefNode; we wrap the inherited
     Python-wrapper Entry directly.
+
+    When the Python wrapper is in a different compilation unit (static linkage prevents
+    cross-file references), set use_pycfunction_check=True.  OverrideCheckNode then
+    uses !PyCFunction_Check(func) instead of __Pyx_IsSameCFunction to detect pure-Python
+    overrides.  This is correct because:
+      - Python def-overrides are never CFunction objects → detected
+      - Cython subclasses use direct vtable dispatch (overwriting the trampoline slot),
+        so the trampoline is never invoked for Cython overrides
     """
     fused_py_func = None
     is_module_scope = False
+    use_pycfunction_check = False
 
-    def __init__(self, entry):
+    def __init__(self, entry, use_pycfunction_check=False):
         self.entry = entry
+        self.use_pycfunction_check = use_pycfunction_check
 
 
 class OverrideCheckNode(StatNode):
@@ -5987,7 +6033,13 @@ class OverrideCheckNode(StatNode):
             code.error_goto_if_null(func_node_temp, self.pos)))
         code.put_gotref(func_node_temp, py_object_type)
 
-        code.putln("if (!__Pyx_IsSameCFunction(%s, (void(*)(void)) %s)) {" % (func_node_temp, method_entry.func_cname))
+        if self.py_func.use_pycfunction_check:
+            # Cross-module trampoline: the base Python wrapper is static in another .cpp.
+            # Detect Python overrides via type check instead: pure-Python overrides are
+            # not CFunction objects; Cython overrides go through their own vtable slot.
+            code.putln("if (!PyCFunction_Check(%s)) {" % func_node_temp)
+        else:
+            code.putln("if (!__Pyx_IsSameCFunction(%s, (void(*)(void)) %s)) {" % (func_node_temp, method_entry.func_cname))
         self.body.generate_execution_code(code)
         code.putln("}")
 

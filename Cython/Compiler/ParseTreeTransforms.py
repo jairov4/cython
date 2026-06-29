@@ -2572,6 +2572,7 @@ if VALUE is not None:
         # every inherited cpdef/ccall method that was NOT explicitly overridden here
         # needs a synthesised trampoline with OverrideCheckNode so Python subclasses
         # of this class can override those methods.
+        from . import TypeSlots
         scope = node.scope
         trampolines = []
         # Collect names already locally handled (non-inherited scope entries or
@@ -2594,6 +2595,17 @@ if VALUE is not None:
             if entry.is_final_cmethod:
                 continue
             if entry.name in local_names:
+                continue
+            # Skip non-promotable special methods.  Promotable ones (__add__,
+            # __eq__, etc.) have a calling convention matching their Python type
+            # slot and can be trampolined normally.  Non-promotable ones
+            # (__init__, __dealloc__, etc.) use a different Python-slot signature
+            # and would cause a C type mismatch when assigned to tp_init etc.
+            # Python's own MRO/tp_slot machinery handles dispatch for those.
+            # NOTE: is_special is not propagated by declare_inherited_c_attributes,
+            # so we compare by name.
+            if (entry.name.startswith('__') and entry.name.endswith('__')
+                    and entry.name not in TypeSlots.CPDEF_PROMOTABLE_SPECIAL_METHODS):
                 continue
             trampoline = Nodes.CFuncDefNode(
                 entry.pos,
