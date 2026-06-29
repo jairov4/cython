@@ -3495,7 +3495,7 @@ class CFuncDefNode(FuncDefNode):
         # we call through its vtabptr to avoid re-entering our own trampoline.
         # Two indicators for "defined in this class":
         #   - not e.is_inherited: freshly declared here (covers pxd-only declarations)
-        #   - e.func_cname: re-declared with same signature — declare_cfunction(defining=True)
+        #   - e.func_cname: redeclared with same signature — declare_cfunction(defining=True)
         #     sets func_cname on the existing inherited entry without clearing is_inherited
         defining_base_type = env.parent_type.base_type
         defining_entry = inherited_entry  # fallback
