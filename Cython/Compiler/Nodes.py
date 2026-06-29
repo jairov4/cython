@@ -3490,11 +3490,14 @@ class CFuncDefNode(FuncDefNode):
 
         # Walk up to find the first class that DEFINES (not inherits) this method;
         # we call through its vtabptr to avoid re-entering our own trampoline.
+        # Use func_cname as the "defined here" indicator: declare_inherited_c_attributes
+        # never sets func_cname; declare_cfunction with defining=True does, even when it
+        # updates an existing inherited entry in-place (is_inherited stays True in that case).
         defining_base_type = env.parent_type.base_type
         defining_entry = inherited_entry  # fallback
         while defining_base_type and defining_base_type.scope:
             e = defining_base_type.scope.lookup(name)
-            if e and not e.is_inherited:
+            if e and e.func_cname:
                 defining_entry = e
                 break
             defining_base_type = defining_base_type.base_type
@@ -3502,7 +3505,7 @@ class CFuncDefNode(FuncDefNode):
         # OverrideCheckNode: use the inherited Python-wrapper Entry as py_func proxy.
         # The comparison is against Base's __pyx_pw_ function; Python overrides in
         # subclasses of Derived will differ from that → dispatch fires correctly.
-        py_wrapper_entry = inherited_entry.as_variable
+        py_wrapper_entry = inherited_entry.as_variable or (defining_entry.as_variable if defining_entry else None)
         fake_py_func = _MinimalPyFuncRef(py_wrapper_entry)
         self.override = OverrideCheckNode(self.pos, py_func=fake_py_func)
         self.body = StatListNode(

@@ -235,6 +235,30 @@ def test_cython_subclass_of_locked():
     return g.n()
 
 
+def test_cython_subclass_of_locked_via_trampoline():
+    """
+    >>> test_cython_subclass_of_locked_via_trampoline()
+    66
+    """
+    cdef CBaseF g = CGrandChild()   # upcast to base class
+    return g.n()
+
+
+cpdef invoke_in_c(CBaseF g):
+    return g.n()
+
+
+def test_cython_subclass_of_locked_via_python():
+    """
+    >>> class PyGrandChild(CGrandChild):
+    ...     def n(self):
+    ...         return 666
+    >>> invoke_in_c(PyGrandChild())
+    666
+    """
+    pass
+
+
 # ============================================================
 # 7. Repeated @python_subclassing(True) — no error, no warning
 # ============================================================
@@ -268,3 +292,37 @@ def test_repeated_true_no_error():
     77
     """
     return _PyRepLeaf().v()
+
+
+# ============================================================
+# 8. Vtable dispatch through a @False grandparent-typed variable
+#    when the @True middle class does NOT override the method.
+#    The trampoline must be synthesised in GapMiddle so that
+#    calling through a GapBase* vtable slot dispatches to the
+#    Python override in _PyGapChild.
+# ============================================================
+
+@cython.python_subclassing(False)
+cdef class GapBase:
+    cpdef int gap_method(self):
+        return 1
+
+
+@cython.python_subclassing(True)
+cdef class GapMiddle(GapBase):
+    pass   # does NOT override gap_method — trampoline must be synthesised
+
+
+class _PyGapChild(GapMiddle):
+    def gap_method(self):
+        return 42
+
+
+def test_vtable_dispatch_through_false_grandparent():
+    """
+    >>> test_vtable_dispatch_through_false_grandparent()
+    42 1
+    """
+    cdef GapBase g = _PyGapChild()   # upcast to @False grandparent
+    cdef GapBase b = GapBase()
+    print("%d %d" % (g.gap_method(), b.gap_method()))

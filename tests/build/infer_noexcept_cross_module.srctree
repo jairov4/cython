@@ -1,9 +1,11 @@
+# mode: run
+
 # Tests cross-module noexcept fact propagation in multi-source compilation
 # (compile_multiple) with --cimport-from-pyx, both sequential and parallel.
 # Module B cimports module A's final class / module-level functions from the
 # .pyx; the consumer cannot re-run the body inference (declarations-only
 # parse), so the facts phase must inject the producer's inference results.
-#
+
 # Non-LTO: final methods use vtable dispatch (->method) to avoid unresolvable
 # __pyx_f_ symbol references under Python's RTLD_LOCAL per-so loading.
 # LTO: modules are expected to be linked together, so direct __pyx_f_ calls

@@ -2576,22 +2576,24 @@ if VALUE is not None:
         trampolines = []
         # Collect names already locally handled (non-inherited scope entries or
         # existing cpdef-body trampolines) to avoid double-synthesis.
+        # Use func_cname as the indicator of "explicitly declared in this class":
+        # declare_inherited_c_attributes never sets func_cname; declare_cfunction with
+        # defining=True does (even when it updates an existing inherited entry rather
+        # than creating a new one, because entries with the same signature are reused
+        # in-place with is_inherited left True).
         local_names = {
-            e.name for e in scope.cfunc_entries if not e.is_inherited
+            e.name for e in scope.cfunc_entries if e.func_cname
         }
         # Also skip entries queued as cpdef_method_trampoline bodies (def overrides).
         if scope.cpdef_method_trampolines:
             local_names.update(pydef.entry.name
                                 for pydef, _ in scope.cpdef_method_trampolines)
         for entry in list(scope.cfunc_entries):
-            if not entry.is_inherited or not entry.is_overridable:
+            if not entry.is_inherited or not entry.type.is_overridable:
                 continue
             if entry.is_final_cmethod:
                 continue
             if entry.name in local_names:
-                continue
-            if not entry.as_variable:
-                # No Python wrapper → can't build OverrideCheckNode; skip.
                 continue
             trampoline = Nodes.CFuncDefNode(
                 entry.pos,
