@@ -2,6 +2,13 @@
 Cython Changelog
 ================
 
+3.3.1a1 (2026-??-??)
+
+Bugs fixed
+----------
+
+* Issue in the behavior of ``python_subclassing``` decorator.
+
 3.3.0a1 (2026-??-??)
 ====================
 
